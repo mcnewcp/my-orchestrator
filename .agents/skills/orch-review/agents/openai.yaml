@@ -1,5 +1,0 @@
-interface:
-  display_name: "Orch — Reviewer"
-  short_description: "Render a verdict on a PR against its contract"
-policy:
-  allow_implicit_invocation: false

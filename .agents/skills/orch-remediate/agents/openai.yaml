@@ -1,5 +1,0 @@
-interface:
-  display_name: "Orch — Remediator"
-  short_description: "Fix one blocking finding with a minimal diff"
-policy:
-  allow_implicit_invocation: false
