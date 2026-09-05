@@ -1,2 +1,6 @@
 # local artifacts
 .scratch/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

@@ -1,0 +1,5 @@
+interface:
+  display_name: "Orch — Contractor"
+  short_description: "Turn an issue into a verifiable contract"
+policy:
+  allow_implicit_invocation: false

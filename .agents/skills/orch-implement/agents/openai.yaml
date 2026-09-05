@@ -1,0 +1,5 @@
+interface:
+  display_name: "Orch — Implementer"
+  short_description: "Build the contract test-first and open a draft PR"
+policy:
+  allow_implicit_invocation: false

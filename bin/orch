@@ -1,0 +1,17 @@
+#!/bin/sh
+# Run the orch CLI against the caller's cwd (the target repo).
+# `uv run --project` selects the orchestrator's environment WITHOUT changing directory
+# (`--directory` would chdir; do not use it here).
+set -e
+# Resolve $0 through any symlinks (this script is installed by `ln -s`; macOS has no readlink -f).
+self=$0
+while [ -L "$self" ]; do
+  dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P)
+  target=$(readlink "$self")
+  case $target in
+    /*) self=$target ;;
+    *) self=$dir/$target ;;
+  esac
+done
+here=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P)
+exec uv run --project "$(dirname -- "$here")" orch "$@"

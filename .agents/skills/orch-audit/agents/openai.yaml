@@ -1,0 +1,5 @@
+interface:
+  display_name: "Orch — Auditor"
+  short_description: "Check a PR against its contract, mechanically"
+policy:
+  allow_implicit_invocation: false
