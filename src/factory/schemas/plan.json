@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "description": "Output of the plan role: an implementation plan someone who never saw this conversation could follow.",
+  "additionalProperties": false,
+  "properties": {
+    "markdown": {
+      "type": "string",
+      "description": "The whole plan as markdown. Must contain the headings '## Files that change' (every path the build will touch, exact relative paths) and '## Proof' (exact commands and what each demonstrates), plus order of work and risks."
+    }
+  },
+  "required": ["markdown"]
+}

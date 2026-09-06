@@ -1,0 +1,22 @@
+[factory]
+harness = "claude"                 # claude | codex
+auth = "api"                       # api | subscription (attended only; poll refuses it)
+base_branch = "main"
+max_fix_rounds = 3
+stage_timeout_min = 45
+checks = [["make", "test"], ["make", "lint"]]   # argv arrays, run without a shell
+test_paths = ["tests/"]
+protected_paths = []               # added to the built-in list (design §9)
+max_nits = 10                      # review gate: at most this many new nits per round
+
+[poll]
+label = "factory"                  # the one label read from GitHub
+max_consecutive_failures = 3
+
+[harness.claude]
+model = ""                         # empty = CLI default
+pinned_version = ""                # doctor warns on mismatch; actual version recorded in state.json
+
+[harness.codex]
+model = ""
+pinned_version = ""

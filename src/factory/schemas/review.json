@@ -1,0 +1,77 @@
+{
+  "type": "object",
+  "description": "Output of the review role: an update for every open finding in the ledger, plus any new findings supported by evidence from the diff.",
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "Two to five sentences: what the diff does, what each pass (bugs, security, compliance) found, and whether the change is fit to merge."
+    },
+    "updates": {
+      "type": "array",
+      "description": "One entry for every finding marked NEEDS UPDATE in the ledger. No entries for findings that are already resolved or dismissed.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The finding id from the ledger, e.g. 'F3'."
+          },
+          "status": {
+            "type": "string",
+            "description": "'resolved' only when the diff demonstrably fixes it; otherwise 'unresolved'.",
+            "enum": ["resolved", "unresolved"]
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Why, citing the diff: file path, line, and a quoted snippet. For 'unresolved', say what is still wrong."
+          }
+        },
+        "required": ["id", "status", "evidence"]
+      }
+    },
+    "new": {
+      "type": "array",
+      "description": "Findings raised this round. Only defects you can point at in the diff. Never re-raise a resolved or dismissed finding. Respect the nit cap in the review policy.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "severity": {
+            "type": "string",
+            "description": "'important' blocks the PR and must be fixed; 'nit' never blocks and is never auto-fixed.",
+            "enum": ["important", "nit"]
+          },
+          "pass": {
+            "type": "string",
+            "description": "Which review pass raised it: 'bugs' (correctness), 'security', or 'compliance' (against spec.md and plan.md).",
+            "enum": ["bugs", "security", "compliance"]
+          },
+          "file": {
+            "type": "string",
+            "description": "Repository-relative path of the offending file, exactly as it appears in the diff."
+          },
+          "line": {
+            "type": ["integer", "null"],
+            "description": "Line number in the new version of the file, or null when the finding is not tied to one line."
+          },
+          "title": {
+            "type": "string",
+            "description": "One short imperative line naming the defect. Stable wording: it is hashed to detect duplicates across rounds."
+          },
+          "detail": {
+            "type": "string",
+            "description": "What goes wrong, under which inputs or conditions, and what the consequence is."
+          },
+          "evidence": {
+            "type": "string",
+            "description": "A quoted snippet from the diff at file:line that shows the defect, plus the reasoning that connects it to the claim."
+          }
+        },
+        "required": ["severity", "pass", "file", "line", "title", "detail", "evidence"]
+      }
+    }
+  },
+  "required": ["summary", "updates", "new"]
+}

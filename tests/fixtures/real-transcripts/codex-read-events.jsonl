@@ -1,0 +1,11 @@
+{"type":"thread.started","thread_id":"01a078e9-763c-7b20-aec5-1c0784378f47"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll read `prompt.md` and follow its instructions."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc \"pwd && rg --files -g 'prompt.md' -g 'AGENTS.md' -g '\"'!node_modules'\"' -g '\"'!.git'\"'\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc \"pwd && rg --files -g 'prompt.md' -g 'AGENTS.md' -g '\"'!node_modules'\"' -g '\"'!.git'\"'\"","aggregated_output":"/tmp/claude-1000/-home-mcnewcp-personal-factory-prototype-cc/ef923c68-8337-48e3-8aa5-a221b477a292/scratchpad/smoke-codex\nprompt.md\n","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_2","type":"command_execution","command":"/bin/bash -lc 'cat prompt.md'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"/bin/bash -lc 'cat prompt.md'","aggregated_output":"Read the file note.txt in the current directory. Return ok=true and first_line set to its first line. Do not modify any files.\n","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_3","type":"command_execution","command":"/bin/bash -lc 'head -n 1 note.txt'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"/bin/bash -lc 'head -n 1 note.txt'","aggregated_output":"hello codex smoke\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_4","type":"agent_message","text":"{\"ok\":true,\"first_line\":\"hello codex smoke\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":62730,"cached_input_tokens":46336,"cache_write_input_tokens":0,"output_tokens":160,"reasoning_output_tokens":0}}

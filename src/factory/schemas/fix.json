@@ -1,0 +1,46 @@
+{
+  "type": "object",
+  "description": "Output of the fix role: a report on each Important finding it was given. Claims only - the next review decides what is actually resolved.",
+  "additionalProperties": false,
+  "properties": {
+    "addressed": {
+      "type": "array",
+      "description": "Findings you changed code for. Every id here must appear in the findings you were given.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The finding id, e.g. 'F3'."
+          },
+          "how": {
+            "type": "string",
+            "description": "The change you made: files touched and why that removes the defect. Recorded as a claim, not as proof."
+          }
+        },
+        "required": ["id", "how"]
+      }
+    },
+    "not_addressed": {
+      "type": "array",
+      "description": "Findings you did not change code for. Empty array when you addressed all of them.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The finding id, e.g. 'F3'."
+          },
+          "why": {
+            "type": "string",
+            "description": "Why you left it: the fix is out of the allowed edit scope, the finding looks wrong, or the fix needs a decision a human must make."
+          }
+        },
+        "required": ["id", "why"]
+      }
+    }
+  },
+  "required": ["addressed", "not_addressed"]
+}

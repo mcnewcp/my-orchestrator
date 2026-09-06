@@ -1,2 +1,11 @@
 # local artifacts
 .scratch/
+.factory/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+tests/.fake_dir

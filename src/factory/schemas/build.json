@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "description": "Output of the build role: what was implemented and where it departed from the plan.",
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "What you implemented and how you proved it: the files changed, the tests added, the proof commands and checks you ran and their result."
+    },
+    "deviations": {
+      "type": "array",
+      "description": "Every departure from the plan, one entry each. Empty array when you followed the plan exactly. Each deviation must also be written into plan.md in this same pass.",
+      "items": {
+        "type": "string",
+        "description": "One deviation: what the plan said, what you did instead, and why."
+      }
+    }
+  },
+  "required": ["summary", "deviations"]
+}

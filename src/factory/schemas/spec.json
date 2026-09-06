@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "description": "Output of the spec role: a requirements and design spec for this codebase, plus only the questions that block implementation.",
+  "additionalProperties": false,
+  "properties": {
+    "markdown": {
+      "type": "string",
+      "description": "The whole spec as markdown, starting at a level-2 heading: Problem, Proposed outcome, Affected users and systems, Constraints, Acceptance criteria, Flagged concerns. Do not include an 'Open questions' section; the factory appends one."
+    },
+    "open_questions": {
+      "type": "array",
+      "description": "Only questions that block implementation, one self-contained sentence each. Empty array when nothing blocks - that is the normal outcome.",
+      "items": {
+        "type": "string",
+        "description": "One blocking question, answerable without this transcript, saying what it blocks."
+      }
+    }
+  },
+  "required": ["markdown", "open_questions"]
+}

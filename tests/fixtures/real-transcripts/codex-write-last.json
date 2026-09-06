@@ -1,0 +1,1 @@
+{"summary":"Created probe.txt containing exactly `factory-probe` followed by a newline. Ran the specified Python command and confirmed it printed `probe-ok`. Created no other files; did not run git commit or git push."}

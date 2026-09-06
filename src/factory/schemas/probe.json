@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "description": "Doctor probe result: proves the harness can run and return schema-valid structured output.",
+  "additionalProperties": false,
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "description": "True when you completed the probe instructions."
+    },
+    "note": {
+      "type": "string",
+      "description": "One short line about what you did, or what went wrong."
+    }
+  },
+  "required": ["ok", "note"]
+}
