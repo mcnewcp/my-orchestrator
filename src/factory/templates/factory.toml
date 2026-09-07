@@ -8,6 +8,9 @@ checks = [["make", "test"], ["make", "lint"]]   # argv arrays, run without a she
 test_paths = ["tests/"]
 protected_paths = []               # added to the built-in list (design §9)
 max_nits = 10                      # review gate: at most this many new nits per round
+max_diff_bytes = 300000            # review diff above this is truncated (stat + largest files first)
+transient_paths = []               # extra tooling droppings the worktree-clean rule ignores
+env_passthrough = []               # extra env var NAMES forwarded to harness + check subprocesses
 
 [poll]
 label = "factory"                  # the one label read from GitHub
@@ -16,7 +19,11 @@ max_consecutive_failures = 3
 [harness.claude]
 model = ""                         # empty = CLI default
 pinned_version = ""                # doctor warns on mismatch; actual version recorded in state.json
+max_turns_read = 30                # the turn cap binds before the stage timeout; raise after watching num_turns
+max_turns_write = 120
+max_budget_usd = 0.0               # 0 = no cap
 
 [harness.codex]
 model = ""
 pinned_version = ""
+writable_dirs = []                 # extra --add-dir roots for workspace-write, e.g. ["~/.cache/uv"]

@@ -24,13 +24,18 @@ from factory.state import (
     State,
     atomic_write_json,
     atomic_write_text,
+    clear_last_error,
+    current_boot_id,
     finding_key,
     is_parked,
+    last_error_path,
     no_progress,
     normalize_title,
     now_iso,
     parse_open_questions,
+    pid_start_time,
     read_doctor_records,
+    read_last_error,
     read_poll_journal,
     render_intent,
     render_spec_md,
@@ -38,6 +43,7 @@ from factory.state import (
     state_only_paths,
     work_dir,
     write_doctor_record,
+    write_last_error,
     write_poll_journal,
 )
 
@@ -268,6 +274,35 @@ def test_state_from_dict_defaults_optional_record_fields():
     assert state.stages["spec"].harness == ""
     assert state.reviews[0].fix_rounds_at == 0
     assert state.reviews[0].diff_truncated is False
+    assert state.reviews[0].gated is False
+
+
+def test_a_gated_review_round_trips_and_an_older_state_file_defaults_it_false(tmp_path):
+    state = make_state(reviews=[review_record(1, open_=1, resolved=0, fix_rounds_at=1)])
+    assert state.reviews[0].gated is False
+
+    state.mark_last_review_gated()
+    state.save(tmp_path)
+    written = json.loads(State.path(tmp_path, ISSUE).read_text(encoding="utf-8"))
+    assert written["reviews"][0]["gated"] is True
+    assert State.load(tmp_path, ISSUE).reviews[0].gated is True
+
+    del written["reviews"][0]["gated"]  # a state.json committed before the field existed
+    atomic_write_json(State.path(tmp_path, ISSUE), written)
+    assert State.load(tmp_path, ISSUE).reviews[0].gated is False
+
+
+def test_mark_last_review_gated_marks_only_the_latest_review():
+    state = make_state()
+    state.mark_last_review_gated()  # open_questions parks before any review has run
+    assert state.reviews == []
+
+    state.reviews = [
+        review_record(1, open_=1, resolved=0, fix_rounds_at=0),
+        review_record(2, open_=1, resolved=0, fix_rounds_at=1),
+    ]
+    state.mark_last_review_gated()
+    assert [review.gated for review in state.reviews] == [False, True]
 
 
 def test_state_derived_predicates():
@@ -851,31 +886,56 @@ def test_parse_open_questions_without_the_heading_is_empty():
 
 # ---------------------------------------------------------------- RunLock
 
+requires_pid_identity = pytest.mark.skipif(
+    not (current_boot_id() and pid_start_time(os.getpid())),
+    reason="this host's /proc exposes no boot_id or pid start time",
+)
 
-def test_run_lock_round_trips_and_clear_is_idempotent(tmp_path):
+
+def foreign_lock(pid: int, **overrides) -> RunLock:
+    """A lock written by another process, with whatever identity that pid really has."""
     lock = RunLock(
         issue=ISSUE,
         stage="build",
-        pid=os.getpid(),
+        pid=pid,
         started_at=now_iso(),
-        worktree=str(tmp_path / "wt"),
+        worktree="/wt",
+        boot_id=current_boot_id(),
+        pid_start=pid_start_time(pid),
     )
+    for name, value in overrides.items():
+        setattr(lock, name, value)
+    return lock
+
+
+def test_run_lock_round_trips_and_clear_is_idempotent(tmp_path):
+    lock = RunLock.create(ISSUE, "build", tmp_path / "wt")
     lock.write(tmp_path)
     assert RunLock.path(tmp_path, ISSUE) == tmp_path / "run" / "42.json"
 
     read_back = RunLock.read(tmp_path, ISSUE)
     assert read_back == lock
     assert read_back.pid_alive() is True
+    assert read_back.is_mine() is True
 
     RunLock.clear(tmp_path, ISSUE)
     RunLock.clear(tmp_path, ISSUE)
     assert RunLock.read(tmp_path, ISSUE) is None
 
 
+def test_create_stamps_this_process_and_its_pid_identity(tmp_path):
+    lock = RunLock.create(ISSUE, "review", tmp_path / "wt", last_error="checks failed")
+
+    assert lock.pid == os.getpid()
+    assert lock.stage == "review" and lock.worktree == str(tmp_path / "wt")
+    assert lock.last_error == "checks failed"
+    assert lock.started_at.endswith("Z")
+    assert lock.boot_id == current_boot_id()
+    assert lock.pid_start == pid_start_time(os.getpid())
+
+
 def test_run_lock_write_updates_the_stage_and_carries_last_error(tmp_path):
-    lock = RunLock(
-        issue=ISSUE, stage="run", pid=os.getpid(), started_at=now_iso(), worktree=str(tmp_path)
-    )
+    lock = RunLock.create(ISSUE, "run", tmp_path)
     lock.write(tmp_path)
     lock.last_error = "checks failed: python3 checks.py"
     lock.write(tmp_path, stage="build")
@@ -896,10 +956,32 @@ def test_run_lock_read_returns_none_for_missing_or_corrupt_files(tmp_path):
     assert RunLock.read(tmp_path, ISSUE) is None  # no pid: not a lock
 
 
+def test_a_lock_written_before_the_identity_fields_existed_still_loads(tmp_path):
+    """Older `.factory/run/<n>.json` files have no boot_id/pid_start: unknown identity never contradicts the
+    pid, so the checks degrade to exactly the pid comparison they strengthen."""
+    atomic_write_json(
+        RunLock.path(tmp_path, ISSUE),
+        {
+            "issue": ISSUE,
+            "stage": "build",
+            "pid": os.getpid(),
+            "started_at": now_iso(),
+            "worktree": "/wt",
+            "last_error": None,
+        },
+    )
+
+    lock = RunLock.read(tmp_path, ISSUE)
+    assert lock.boot_id == "" and lock.pid_start == ""
+    assert lock.is_mine() is True
+    assert lock.pid_alive() is True
+    assert RunLock.clear_if_owned(tmp_path, ISSUE) is True
+
+
 def test_pid_alive_is_false_for_a_finished_process():
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
     proc.wait()
-    lock = RunLock(issue=ISSUE, stage="build", pid=proc.pid, started_at="", worktree="")
+    lock = foreign_lock(proc.pid)
     assert lock.pid_alive() is False
     assert (
         RunLock(issue=ISSUE, stage="build", pid=0, started_at="", worktree="").pid_alive() is False
@@ -913,6 +995,103 @@ def test_pid_alive_counts_permission_error_as_alive(monkeypatch):
     monkeypatch.setattr(os, "kill", deny)
     lock = RunLock(issue=ISSUE, stage="build", pid=1, started_at="", worktree="")
     assert lock.pid_alive() is True
+
+
+@requires_pid_identity
+def test_a_recycled_pid_is_a_dead_writer_even_though_the_pid_is_alive():
+    """Design §13: each tick is a fresh container, so this pid was somebody else's an hour ago. A lock naming
+    a live pid that started at another time — or under another kernel boot — is an interrupted stage."""
+    recycled = RunLock.create(ISSUE, "build", "/wt")
+    recycled.pid_start = str(int(pid_start_time(os.getpid())) + 1)
+    assert recycled.pid_alive() is False
+    assert recycled.is_mine() is False
+
+    rebooted = RunLock.create(ISSUE, "build", "/wt")
+    rebooted.boot_id = "00000000-0000-0000-0000-000000000000"
+    assert rebooted.pid_alive() is False
+    assert rebooted.is_mine() is False
+
+
+def test_is_mine_is_false_for_another_live_process(tmp_path):
+    lock = foreign_lock(os.getppid())
+    assert lock.is_mine() is False
+    assert lock.pid_alive() is True  # the parent is still running: a genuinely held lock
+
+
+def test_clear_if_owned_removes_my_lock_and_reports_an_absent_one_as_gone(tmp_path):
+    assert RunLock.clear_if_owned(tmp_path, ISSUE) is True  # nothing there is "gone"
+
+    RunLock.create(ISSUE, "build", tmp_path).write(tmp_path)
+    assert RunLock.clear_if_owned(tmp_path, ISSUE) is True
+    assert RunLock.read(tmp_path, ISSUE) is None
+
+
+def test_clear_if_owned_refuses_a_lock_this_process_did_not_write(tmp_path):
+    """cli.py clears the lock in a finally; in a container it must never delete the lock a concurrent
+    command in another container is holding, whatever pid that one happens to have."""
+    foreign_lock(os.getppid()).write(tmp_path)
+
+    assert RunLock.clear_if_owned(tmp_path, ISSUE) is False
+    assert RunLock.read(tmp_path, ISSUE).pid == os.getppid()
+
+    RunLock.clear(tmp_path, ISSUE)  # `abandon` and the tests may still force it
+    assert RunLock.read(tmp_path, ISSUE) is None
+
+
+@requires_pid_identity
+def test_clear_if_owned_refuses_a_lock_from_a_process_that_reused_my_pid(tmp_path):
+    lock = RunLock.create(ISSUE, "build", tmp_path)
+    lock.pid_start = str(int(pid_start_time(os.getpid())) + 1)
+    lock.write(tmp_path)
+
+    assert RunLock.clear_if_owned(tmp_path, ISSUE) is False
+    assert RunLock.path(tmp_path, ISSUE).exists()
+
+
+def test_clear_if_owned_leaves_an_unreadable_lock_alone(tmp_path):
+    path = RunLock.path(tmp_path, ISSUE)
+    path.parent.mkdir(parents=True)
+    path.write_text("{ truncated", encoding="utf-8")
+
+    assert RunLock.clear_if_owned(tmp_path, ISSUE) is False
+    assert path.exists()  # not provably ours; the next _take_lock overwrites it instead
+
+
+# ---------------------------------------------------------------- the last-error file
+
+
+def test_last_error_round_trips_and_survives_the_lock_being_cleared(tmp_path):
+    assert read_last_error(tmp_path, ISSUE) is None
+
+    write_last_error(tmp_path, ISSUE, "checks failed after build: python3 checks.py")
+    RunLock.clear(tmp_path, ISSUE)  # the command ended; only the file is left
+
+    assert last_error_path(tmp_path, ISSUE) == tmp_path / "run" / "42.last-error"
+    assert read_last_error(tmp_path, ISSUE) == "checks failed after build: python3 checks.py"
+    assert last_error_path(tmp_path, ISSUE).read_text(encoding="utf-8").endswith("\n")
+
+    clear_last_error(tmp_path, ISSUE)
+    clear_last_error(tmp_path, ISSUE)
+    assert read_last_error(tmp_path, ISSUE) is None
+
+
+def test_writing_a_blank_last_error_clears_it(tmp_path):
+    write_last_error(tmp_path, ISSUE, "gate: no_progress")
+    write_last_error(tmp_path, ISSUE, "   \n")
+
+    assert read_last_error(tmp_path, ISSUE) is None
+    assert not last_error_path(tmp_path, ISSUE).exists()
+
+
+def test_the_last_error_file_is_per_issue(tmp_path):
+    write_last_error(tmp_path, 7, "seven failed")
+    write_last_error(tmp_path, 8, "eight failed")
+
+    assert read_last_error(tmp_path, 7) == "seven failed"
+    assert read_last_error(tmp_path, 8) == "eight failed"
+    clear_last_error(tmp_path, 7)
+    assert read_last_error(tmp_path, 7) is None
+    assert read_last_error(tmp_path, 8) == "eight failed"
 
 
 # ---------------------------------------------------------------- poll journal / doctor records

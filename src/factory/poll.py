@@ -3,17 +3,19 @@
 0. Preflight: config.auth must be "api" and the selected key present (build_env raises) — else exit 1 before touching
    GitHub. doctor.json must hold a current record for (harness, auth, factory version, harness CLI version), else run
    doctor.doctor(); FAIL -> exit 1.
-1. Lock .factory/run/poll.lock (O_EXCL, pid inside; a dead pid makes it stale and it is replaced); held -> exit 0.
+1. Lock .factory/run/poll.lock with flock(LOCK_EX | LOCK_NB), held open for the whole tick; already held -> exit 0.
 2. Discover: gh.list_open_issues_with_label(config.poll_label), ascending.
-3. Classify each from local state after repo.fetch() (worktree created from origin/factory/<n> where needed):
+3. Classify each from local state after repo.fetch() and repo.sync_with_remote() (worktree created from
+   origin/factory/<n> where needed; a strictly-ahead remote is fast-forwarded, a diverged one is a per-issue error):
    no branch anywhere -> eligible ("new"); outcome None -> eligible ("resume"); needs_human and not
    state.is_parked(...) -> eligible ("operator acted"); parked -> skip; done -> skip;
    journal[n].sha == HEAD and journal[n].failures >= max_consecutive_failures -> skip ("capped").
    The first time an issue is skipped as capped, post one idempotent PR comment (gh.render_capped_comment, CAPPED_MARKER)
    and record capped_comment_sha.
-4. Run run_issue(n) for each eligible issue in turn. Exit 0 or 2 -> delete journal[n]. Exit 1 at HEAD h: if
-   journal[n].sha == h then failures += 1 else journal[n] = {failures: 1, sha: h}; last_error recorded. The counter is
-   consecutive failures at ONE HEAD, so any HEAD movement (operator action) resets it.
+4. Run run_issue(n) for each eligible issue in turn. Exit 0 or 2 -> delete journal[n]. Exit 1: if journal[n].sha is
+   the HEAD the run STARTED from then failures += 1, else journal[n] = {failures: 1}; the entry records HEAD after the
+   run and the last_error. The counter is consecutive failures over ONE stretch of history, so an operator's commit
+   between two ticks resets it while a commit the failing run made itself does not.
 5. Exit 1 if any run exited 1, else 0.
 
 Journal keys are strings (`.factory/poll.json` round-trips through JSON): journal[str(issue)]. An issue with no branch
@@ -22,11 +24,13 @@ anywhere has no HEAD; its journal entry records the sha as "" so repeated failur
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TextIO
 
 from . import __version__
 from . import doctor as doctor_module
@@ -72,24 +76,31 @@ def poll(
     failures; raises FactoryError only for preflight problems."""
     log = out if out is not None else _discard
     _preflight(repo, config, parent_env=parent_env, log=log)
-    if not acquire_poll_lock(repo.factory_dir):
+    handle = acquire_poll_lock(repo.factory_dir)
+    if handle is None:
         log(f"another poll holds {_poll_lock_path(repo.factory_dir)}; nothing to do")
         return PollResult(exit_code=0)
     try:
         return _poll_locked(repo, gh, config, run_issue=run_issue, log=log)
     finally:
-        release_poll_lock(repo.factory_dir)
+        release_poll_lock(handle)
 
 
 def classify(repo: Repo, config: Config, issue: int, journal: dict) -> tuple[bool, str]:
-    """(eligible, reason) per step 3. Uses state.is_parked with repo.head/parent/changed_paths_of_commit."""
+    """(eligible, reason) per step 3. Uses state.is_parked with repo.head/parent/changed_paths_of_commit.
+
+    The worktree is synced with origin BEFORE HEAD is read (design §12 "from local state after git fetch", §7's
+    start-of-command validation): a host that fetched a commit pushed from elsewhere — an operator's hand fix, a
+    `factory` run on another machine — must classify the issue on that commit, not on the stale local one it
+    would otherwise call parked. A diverged branch raises FactoryError, which the tick reports as this issue's
+    error and no other's."""
     branch = branch_name(issue)
     if not repo.local_branch_exists(branch) and not repo.remote_branch_exists(branch):
         # Nothing to read: the issue starts at `spec`, which creates the branch from the base.
         return _unless_capped(config, journal, issue, NO_COMMIT, NEW)
 
     worktree = repo.ensure_worktree(issue)
-    head = repo.head(worktree)
+    head = repo.sync_with_remote(worktree, branch)
     state = state_module.State.load_or_none(worktree, issue)
     if state is None:
         # The branch exists but no state.json is committed on it (an interrupted first `spec`): resume.
@@ -109,38 +120,62 @@ def classify(repo: Repo, config: Config, issue: int, journal: dict) -> tuple[boo
     return _unless_capped(config, journal, issue, head, RESUME)
 
 
-def acquire_poll_lock(factory_dir: Path) -> bool:
-    """Take `.factory/run/poll.lock` with O_EXCL, this process's pid inside. False when a live poll holds it
-    (design §12 step 1: a held lock is exit 0, not an error). A lock whose pid is dead — a killed container, a
-    rebooted host — is stale and is replaced, so a crash cannot wedge the timer."""
+def acquire_poll_lock(factory_dir: Path) -> TextIO | None:
+    """Take the per-repo poll lock and return the open file that HOLDS it, or None when another poll already
+    does (design §12 step 1: a held lock is exit 0, not an error). Pass what you get to release_poll_lock.
+
+    The lock is an `flock(LOCK_EX | LOCK_NB)` on `.factory/run/poll.lock`, not the file's existence, because
+    neither of the two facts a pid file needs is available on this host:
+      * the kernel drops an flock when the holder dies — killed container, OOM, hard reboot — so a crash cannot
+        wedge the timer, and there is no stale lock to detect;
+      * pids are not evidence of a holder. Every tick runs in a fresh container (design §13) where pid 7 is a
+        different process each time, so a leftover file naming a live-but-unrelated pid would block every
+        future tick, and one naming a pid this container cannot see would be discarded while its owner runs.
+    The pid and started_at written inside the file are for a human reading it over SSH; nothing reads them back.
+    The file is deliberately never unlinked (see release_poll_lock)."""
     path = _poll_lock_path(factory_dir)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Deliberately not a context manager: the open file is what holds the lock.
+        handle = open(path, "a+", encoding="utf-8")
     except OSError as exc:
-        raise FactoryError(f"could not create {path.parent}: {exc}") from exc
-    if _create_lock(path):
-        return True
-    holder = _lock_pid(path)
-    if holder is not None and _pid_alive(holder):
-        return False
+        raise FactoryError(f"could not open the poll lock {path}: {exc}") from exc
     try:
-        path.unlink(missing_ok=True)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
     except OSError as exc:
-        raise FactoryError(f"could not replace the stale poll lock {path}: {exc}") from exc
-    return _create_lock(path)
+        handle.close()
+        raise FactoryError(
+            f"could not lock {path}: {exc}",
+            hint="`.factory/` must be on a filesystem that supports flock (a local volume, not a network share)",
+        ) from exc
+    try:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps({"pid": os.getpid(), "started_at": state_module.now_iso()}) + "\n")
+        handle.flush()
+    except OSError as exc:
+        release_poll_lock(handle)
+        raise FactoryError(f"could not write the poll lock {path}: {exc}") from exc
+    return handle
 
 
-def release_poll_lock(factory_dir: Path) -> None:
-    """Remove the poll lock when this process holds it (or when it holds nothing readable). A lock naming another
-    live process is left alone: releasing it would hand a second poll a lock the first one still relies on."""
-    path = _poll_lock_path(factory_dir)
-    holder = _lock_pid(path)
-    if holder is not None and holder != os.getpid():
+def release_poll_lock(handle: TextIO | None) -> None:
+    """Release the lock acquire_poll_lock returned (None is accepted: nothing was held). Closing the file drops
+    the flock. The file itself stays: unlinking it while another poll waits on that inode would let the next
+    poll create and lock a NEW file, and two ticks would run at once."""
+    if handle is None:
         return
     try:
-        path.unlink(missing_ok=True)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, ValueError):
+        pass  # already closed, or never locked: the close below is what actually releases it
+    try:
+        handle.close()
     except OSError as exc:
-        raise FactoryError(f"could not release the poll lock {path}: {exc}") from exc
+        raise FactoryError(f"could not release the poll lock: {exc}") from exc
 
 
 # ---------------------------------------------------------------- preflight (step 0)
@@ -222,10 +257,12 @@ def _poll_locked(
             continue
         log(f"issue {issue}: {reason}; running")
         result.ran.append(issue)
+        # Read BEFORE the run: a failing stage may commit, and the cap must survive that (_record_outcome).
+        start_head = _issue_head(repo, issue)
         code = _run_one(run_issue, issue, log=log)
         result.outcomes[issue] = code
         log(f"issue {issue}: exit {code}")
-        _record_outcome(repo, journal, issue, code)
+        _record_outcome(repo, journal, issue, code, start_head)
         state_module.write_poll_journal(repo.factory_dir, journal)
         failed = failed or code == 1
     result.exit_code = 1 if failed else 0
@@ -241,16 +278,21 @@ def _run_one(run_issue: Callable[[int], int], issue: int, *, log: Callable[[str]
         return _exit_code_of(exc)
 
 
-def _record_outcome(repo: Repo, journal: dict, issue: int, code: int) -> None:
-    """Step 4. The counter is consecutive exit-1s at ONE commit: any HEAD movement replaces the whole entry
-    (deviation 18), which is what makes an operator's commit clear both the counter and its capped comment."""
+def _record_outcome(repo: Repo, journal: dict, issue: int, code: int, start_head: str) -> None:
+    """Step 4. The counter is consecutive exit-1s over one unbroken stretch of history: an operator's commit
+    replaces the whole entry (deviation 18), which is what clears both the counter and its capped comment.
+
+    `start_head` is HEAD when this attempt STARTED and is what the recorded sha is compared against; the sha
+    stored is HEAD after the attempt, which is what the next tick's `classify` will see. Comparing the two ends
+    of the same attempt instead would let a stage that commits before failing reset its own counter every tick
+    — each attempt would end at a new commit, no two entries would ever match, and the cap could never fire."""
     key = str(issue)
     if code != 1:
         journal.pop(key, None)
         return
     head = _issue_head(repo, issue)
     previous = journal.get(key)
-    if not isinstance(previous, dict) or previous.get("sha") != head:
+    if not isinstance(previous, dict) or previous.get("sha") != start_head:
         previous = {}
     failures = _count(previous.get("failures")) + 1
     journal[key] = {
@@ -350,49 +392,3 @@ def _discard(_message: str) -> None:
 
 def _poll_lock_path(factory_dir: Path) -> Path:
     return Path(factory_dir) / "run" / POLL_LOCK_NAME
-
-
-def _create_lock(path: Path) -> bool:
-    payload = json.dumps({"pid": os.getpid(), "at": state_module.now_iso()}) + "\n"
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
-        return False
-    except OSError as exc:
-        raise FactoryError(f"could not create the poll lock {path}: {exc}") from exc
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-    except OSError as exc:
-        raise FactoryError(f"could not write the poll lock {path}: {exc}") from exc
-    return True
-
-
-def _lock_pid(path: Path) -> int | None:
-    """The pid inside the lock file; None when it is absent, unreadable or holds no pid (then it is stale)."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, ValueError):
-        return None
-    try:
-        parsed = json.loads(text)
-    except ValueError:
-        parsed = None
-    pid = parsed.get("pid") if isinstance(parsed, dict) else None
-    if not isinstance(pid, int) or isinstance(pid, bool):
-        stripped = text.strip()
-        pid = int(stripped) if stripped.isdigit() else None
-    return pid if isinstance(pid, int) and pid > 0 else None
-
-
-def _pid_alive(pid: int) -> bool:
-    """os.kill(pid, 0) semantics; PermissionError counts as alive (someone else's process)."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True

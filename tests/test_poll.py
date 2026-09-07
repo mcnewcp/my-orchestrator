@@ -290,50 +290,95 @@ def poll(world: World, gh: StubGitHub, config: Config, run: StubRun, **kwargs):
 
 
 def test_the_poll_lock_is_exclusive_and_release_frees_it(world):
-    assert poll_module.acquire_poll_lock(world.factory_dir) is True
+    handle = poll_module.acquire_poll_lock(world.factory_dir)
+    assert handle is not None
     lock = world.factory_dir / "run" / "poll.lock"
     assert json.loads(lock.read_text(encoding="utf-8"))["pid"] == os.getpid()
 
-    assert poll_module.acquire_poll_lock(world.factory_dir) is False
+    # A second open file description conflicts even inside this process: the flock is the lock.
+    assert poll_module.acquire_poll_lock(world.factory_dir) is None
 
-    poll_module.release_poll_lock(world.factory_dir)
-    assert not lock.exists()
-    assert poll_module.acquire_poll_lock(world.factory_dir) is True
+    poll_module.release_poll_lock(handle)
+    again = poll_module.acquire_poll_lock(world.factory_dir)
+    assert again is not None
+    assert lock.exists()  # the file is never unlinked; only the flock comes and goes
+    poll_module.release_poll_lock(again)
 
 
-def test_a_lock_left_by_a_dead_process_is_stale_and_is_replaced(world):
+def test_a_lock_file_naming_a_live_foreign_pid_does_not_block_a_tick(world):
+    """Pids are not evidence (design §13: every tick runs in a fresh container, where pid 7 is a different
+    process each time). A leftover file naming a pid that happens to be alive here must not wedge the timer;
+    only a held flock blocks."""
     lock = world.factory_dir / "run" / "poll.lock"
     lock.parent.mkdir(parents=True)
-    lock.write_text(json.dumps({"pid": dead_pid(), "at": now_iso()}), encoding="utf-8")
+    lock.write_text(json.dumps({"pid": os.getppid(), "started_at": now_iso()}), encoding="utf-8")
 
-    assert poll_module.acquire_poll_lock(world.factory_dir) is True
+    handle = poll_module.acquire_poll_lock(world.factory_dir)
+
+    assert handle is not None
     assert json.loads(lock.read_text(encoding="utf-8"))["pid"] == os.getpid()
+    poll_module.release_poll_lock(handle)
 
 
-def test_release_leaves_a_lock_held_by_another_live_process_alone(world):
+def test_a_lock_file_left_by_a_dead_process_is_acquired(world):
     lock = world.factory_dir / "run" / "poll.lock"
     lock.parent.mkdir(parents=True)
-    lock.write_text(json.dumps({"pid": os.getppid(), "at": now_iso()}), encoding="utf-8")
+    lock.write_text(json.dumps({"pid": dead_pid(), "started_at": now_iso()}), encoding="utf-8")
 
-    poll_module.release_poll_lock(world.factory_dir)
+    handle = poll_module.acquire_poll_lock(world.factory_dir)
 
-    assert lock.exists()
+    assert handle is not None
+    poll_module.release_poll_lock(handle)
+
+
+def test_a_lock_held_by_another_process_blocks_until_that_process_dies(world):
+    """Why the lock is an flock: the kernel drops it when the holder dies, so a killed container — or an OOM,
+    or a reboot — cannot leave behind a lock no later tick can clear."""
+    lock = world.factory_dir / "run" / "poll.lock"
+    lock.parent.mkdir(parents=True)
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl, sys\n"
+            "handle = open(sys.argv[1], 'a+')\n"
+            "fcntl.flock(handle.fileno(), fcntl.LOCK_EX)\n"
+            "print('locked', flush=True)\n"
+            "sys.stdin.readline()\n",
+            str(lock),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        assert poll_module.acquire_poll_lock(world.factory_dir) is None
+    finally:
+        holder.kill()
+        holder.wait()
+
+    handle = poll_module.acquire_poll_lock(world.factory_dir)
+    assert handle is not None
+    poll_module.release_poll_lock(handle)
 
 
 def test_a_held_lock_makes_poll_exit_zero_without_touching_github(world, config, no_doctor):
     world.doctor_record()
     lock = world.factory_dir / "run" / "poll.lock"
-    lock.parent.mkdir(parents=True)
-    held = json.dumps({"pid": os.getpid(), "at": now_iso()})
-    lock.write_text(held, encoding="utf-8")
+    handle = poll_module.acquire_poll_lock(world.factory_dir)
+    held = lock.read_text(encoding="utf-8")
     gh, run = StubGitHub(world.checkout, issues=[42]), StubRun()
 
-    result, lines = poll(world, gh, config, run)
+    try:
+        result, lines = poll(world, gh, config, run)
+    finally:
+        poll_module.release_poll_lock(handle)
 
     assert result.exit_code == 0
     assert result.ran == [] and result.skipped == {}
     assert gh.gh_calls == 0 and run.calls == []
-    assert lock.read_text(encoding="utf-8") == held  # the holder's lock is untouched
+    assert lock.read_text(encoding="utf-8") == held  # the holder's record is untouched
     assert any("nothing to do" in line for line in lines)
 
 
@@ -518,6 +563,47 @@ def test_a_worktree_is_rebuilt_from_the_remote_branch(world, config, no_doctor):
     assert world.head(7) == head
 
 
+def test_classify_syncs_the_worktree_with_origin_before_reading_head(world, config, no_doctor):
+    """Design §12 "classify from local state after git fetch" + §7's fast-forward: a commit pushed from
+    elsewhere (an operator on another host, a `factory` run on the workstation) decides the classification.
+    Without the sync this host would read its stale HEAD and re-run an issue that is already parked."""
+    world.doctor_record()
+    wt = world.start(7, push=True)
+    behind = world.head(7)
+    world.park(7, "no_progress")
+    parked_head = world.head(7)
+    world.repo.push(wt, branch_name(7))
+    run_git(["reset", "--hard", behind], wt)  # this host is a tick behind the branch
+    gh, run = StubGitHub(world.checkout, issues=[7]), StubRun()
+
+    result, _ = poll(world, gh, config, run)
+
+    assert result.skipped == {7: "parked"} and run.calls == []
+    assert world.head(7) == parked_head  # fast-forwarded before HEAD was read
+
+
+def test_a_diverged_branch_is_reported_as_that_issue_s_error(world, config, no_doctor):
+    world.doctor_record()
+    world.start(7, push=True)
+    world.operator_commit(7, "src/local.py")  # one commit here ...
+    other = world.root / "other"
+    run_git(["clone", str(world.origin), str(other)], world.root)
+    run_git(["checkout", "-b", branch_name(7), f"origin/{branch_name(7)}"], other)
+    (other / "src" / "remote.py").write_text("# pushed from elsewhere\n", encoding="utf-8")
+    run_git(["add", "-A"], other)
+    run_git(["commit", "-m", "operator: fix from another clone"], other)
+    run_git(["push", "origin", branch_name(7)], other)  # ... and a different one on origin
+    world.start(8)
+    gh, run = StubGitHub(world.checkout, issues=[7, 8]), StubRun()
+
+    result, lines = poll(world, gh, config, run)
+
+    assert result.exit_code == 1
+    assert result.skipped == {7: "error"} and result.ran == [8]
+    assert any("issue 7: cannot classify" in line and "diverged" in line for line in lines)
+    assert "7" not in world.journal()  # a classification failure is not a run failure
+
+
 def test_unreadable_state_reports_exit_one_without_stopping_the_other_issues(
     world, config, no_doctor
 ):
@@ -572,6 +658,48 @@ def test_the_counter_resets_when_head_moves(world, config, no_doctor):
     result, _ = poll(world, gh, config, run)
 
     assert result.ran == [7]  # the stale counter did not cap it
+    entry = world.journal()["7"]
+    assert entry["failures"] == 1 and entry["sha"] == moved
+
+
+def test_a_commit_the_failing_run_made_itself_does_not_reset_the_cap(world, config, no_doctor):
+    """The counter measures consecutive failures over one stretch of history, not consecutive HEADs. A stage
+    that commits before exiting 1 (build's baseline log, a park's evidence) would otherwise end every attempt
+    at a new commit, replace its own journal entry each tick, and never reach the cap."""
+    world.doctor_record()
+    world.start(7)
+    gh = StubGitHub(world.checkout, issues=[7])
+    attempts = []
+
+    def leaky(issue: int) -> int:
+        attempts.append(issue)
+        world.operator_commit(issue, f"src/leak{len(attempts)}.py")  # the run moved HEAD itself
+        return 1
+
+    for expected in (1, 2, 3):
+        result, _ = poll(world, gh, config, leaky)
+        assert result.ran == [7]
+        entry = world.journal()["7"]
+        assert entry["failures"] == expected
+        assert entry["sha"] == world.head(7)  # where the next tick will find the branch
+
+    result, _ = poll(world, gh, config, StubRun())
+
+    assert result.skipped == {7: "capped"} and attempts == [7, 7, 7]
+
+
+def test_an_operator_commit_between_two_ticks_still_resets_the_counter(world, config, no_doctor):
+    world.doctor_record()
+    world.start(7)
+    gh, run = StubGitHub(world.checkout, issues=[7]), StubRun(default=1)
+
+    poll(world, gh, config, run)
+    assert world.journal()["7"]["failures"] == 1
+    moved = world.operator_commit(7)
+
+    result, _ = poll(world, gh, config, run)
+
+    assert result.ran == [7]
     entry = world.journal()["7"]
     assert entry["failures"] == 1 and entry["sha"] == moved
 
@@ -774,4 +902,6 @@ def test_the_lock_is_released_even_when_the_tick_raises(world, config, no_doctor
     with pytest.raises(FactoryError):
         poll(world, gh, config, StubRun())
 
-    assert not (world.factory_dir / "run" / "poll.lock").exists()
+    handle = poll_module.acquire_poll_lock(world.factory_dir)  # the next tick is not locked out
+    assert handle is not None
+    poll_module.release_poll_lock(handle)

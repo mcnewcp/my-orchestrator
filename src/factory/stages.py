@@ -9,9 +9,18 @@ what clears it, idempotent per gate and outcome_sha.
 Invariants
   * cli.py calls prepare(ctx) exactly once per process, before dispatch; stage functions assume a prepared ctx and
     never call it (prepare() returns immediately if ctx.prepared). spec and run are dispatched with need_state=False.
-    status() and init/doctor/poll never call prepare. abandon calls prepare(need_state=False, commit_operator_edits=False).
-  * The RunLock is taken by prepare() for the whole command and cleared by cli.py in a finally; each stage updates its
-    `stage` field (RunLock.write) before doing work. run_harness_stage assumes the lock is held.
+    status() and init/doctor/poll never call prepare. abandon calls prepare(need_state=False,
+    commit_operator_edits=False, fetch=False, strict_clean=False, check_protected=False): it tears the branch down,
+    so a dirty worktree, a diverged remote and a protected-path change on the branch must not stop it.
+  * The RunLock is taken by prepare() for the whole command (ctx.holds_lock records that THIS process wrote it) and
+    cleared with RunLock.clear_if_owned by cli.py / run_issue in a finally — never after a KeyboardInterrupt, whose
+    dead pid is what makes the next command take the interrupted-stage path. Each stage updates the lock's `stage`
+    field (RunLock.write) before doing work. run_harness_stage assumes the lock is held.
+  * Why an attempt failed reaches the next attempt's prompt through TWO channels (state.py): the RunLock's own
+    `last_error` for an interrupted (killed) stage, and `.factory/run/<issue>.last-error` for an ordinary exit 1,
+    which the lock cannot carry because the lock is cleared at the end of every command. prepare() reads both into
+    ctx.last_error (the interrupted one wins, being the more recent), _gate_failure and run_harness_stage write the
+    file, and commit_and_push clears it: a stage that committed has nothing to apologise for.
   * NeedsHuman is constructed in exactly two places: park() (commits the outcome, posts the gate comment) and
     check_parked() (re-raises an already-recorded, already-commented gate). No other function raises it.
   * Round index: review and fix use their round number; spec, plan and build always use 1 (a --force re-run overwrites
@@ -30,12 +39,13 @@ Adaptations to the leaf modules as implemented (see the module notes in the driv
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,6 +64,11 @@ from .state import Ledger, ReviewRecord, RunLock, StageRecord, State
 STAGE_ORDER = ("spec", "plan", "build")  # committed once each; review/fix are rounds
 
 GATES = ("open_questions", "baseline_failing", "no_progress", "rounds_exhausted")
+
+#: The gates raised by the review/fix loop itself. They are recorded on the review that raised them
+#: (ReviewRecord.gated), so `run` reviews the operator's answer instead of re-parking on findings that were
+#: adjudicated by hand — an `accept`/`dismiss` moves HEAD without changing a line of code.
+REVIEW_LOOP_GATES = ("no_progress", "rounds_exhausted")
 
 _CHECK_TAIL_LINES = 200  # of the latest check log, into a {checks} placeholder
 _SPEC_BODY_LINES = 40  # of spec.md, into the draft PR body
@@ -85,7 +100,8 @@ class Context:
     force_push: bool = (
         False  # set by rewind_for_force; commit_and_push then uses --force-with-lease
     )
-    last_error: str | None = None  # from a previous attempt's RunLock (stage_note input)
+    last_error: str | None = None  # why the previous attempt was discarded (stage_note input)
+    holds_lock: bool = False  # this process wrote .factory/run/<issue>.json and must clear it
 
     @property
     def branch(self) -> str:
@@ -182,29 +198,34 @@ def _stage_note(ctx: Context, *, notes: list[str]) -> str:
 
 
 def _run_lock(ctx: Context, *, stage: str | None = None, last_error: str | None = None) -> None:
-    """Read-modify-write `.factory/run/<issue>.json`; prepare() created it, each stage updates it."""
+    """Read-modify-write `.factory/run/<issue>.json`; prepare() created it, each stage updates it.
+
+    A lock that has to be recreated here is built with RunLock.create, which stamps the pid identity
+    (boot_id, pid_start) that is_mine() and pid_alive() check; a hand-built lock would silently degrade
+    both to the bare pid, which repeats across containers."""
     factory_dir = ctx.repo.factory_dir
     lock = RunLock.read(factory_dir, ctx.issue)
     if lock is None:
-        lock = RunLock(
-            issue=ctx.issue,
-            stage=stage or "",
-            pid=os.getpid(),
-            started_at=state_module.now_iso(),
-            worktree=str(ctx.worktree or ""),
-        )
+        lock = RunLock.create(ctx.issue, stage or "", ctx.worktree or "")
     if last_error is not None:
         lock.last_error = last_error
     if ctx.worktree is not None:
         lock.worktree = str(ctx.worktree)
     lock.write(factory_dir, stage=stage)
+    ctx.holds_lock = True
 
 
 # ---------------------------------------------------------------- shared plumbing
 
 
 def prepare(
-    ctx: Context, *, need_state: bool = True, fetch: bool = True, commit_operator_edits: bool = True
+    ctx: Context,
+    *,
+    need_state: bool = True,
+    fetch: bool = True,
+    commit_operator_edits: bool = True,
+    strict_clean: bool = True,
+    check_protected: bool = True,
 ) -> Context:
     """Start-of-command validation (design §7). Returns ctx (prepared=True); returns immediately if already prepared.
     1. ctx.harness = get_harness(name); ctx.harness_env = build_env(name, auth, parent_env, passthrough=...) — this is
@@ -212,15 +233,24 @@ def prepare(
     2. if fetch: repo.fetch(). worktree = repo.ensure_worktree(issue) (recovery from origin/factory/<n>); when neither a
        local nor a remote branch exists: need_state=False -> return with worktree=None (spec creates it; run starts at
        spec), else FactoryError("no branch for issue N; run `factory spec N`").
-    3. RunLock: live pid -> FactoryError("issue N: <stage> in progress (pid P)"); dead pid -> repo.reset_hard(HEAD),
-       ctx.last_error = lock.last_error, log "interrupted <stage> discarded; transcript kept". Then take the lock for
-       this command (stage=<command name>). Step 3's reset runs BEFORE step 5's operator-edit commit, always.
+    3. ctx.last_error = the exit-1 message left by the previous attempt (state.read_last_error), then the RunLock:
+       a live lock this process does not own -> FactoryError("issue N: <stage> in progress (pid P)"); a dead writer ->
+       repo.reset_hard(HEAD), its lock's last_error wins (more recent), log "interrupted <stage> discarded; transcript
+       kept". Then take the lock for this command (ctx.holds_lock = True) and clear the last-error FILE — the lock
+       now carries the message, so nothing is lost if this command is killed too. Step 3's reset runs BEFORE step 5's
+       operator-edit commit, always.
     4. if fetch: repo.sync_with_remote(worktree, branch) (fast-forward if strictly ahead; diverged -> exit 1), then
-       repo.push_if_ahead (a local-only accept/dismiss commit must not die with the host; failure logged, not fatal).
+       repo.push_if_ahead ONCE state.json exists (a local-only accept/dismiss commit must not die with the host;
+       failure logged, not fatal). With no state there is nothing to publish and an empty factory/<n> branch would
+       only have to be cleaned up later.
     5. Dirty paths: under work/<n>/ and commit_operator_edits -> commit "factory(N): operator edits"; is_transient()
-       paths ignored; anything else dirty -> FactoryError naming the paths.
+       paths ignored; anything else dirty -> FactoryError naming the paths, unless strict_clean is False (abandon
+       discards the worktree, so refusing to start would only strand it).
     6. Load State + Ledger; check every stages[*].start_commit and reviews[*].sha is an ancestor of HEAD
-       (else FactoryError "state.json records commit X not reachable from HEAD"). Then ensure_pr(ctx) (best effort).
+       (else FactoryError "state.json records commit X not reachable from HEAD"). Then ensure_pr(ctx) (best effort),
+       and unless check_protected is False the whole-branch protected-path check (design §19, deviation 13): the
+       commands that run no session — build's baseline checks, finalize's checks — would otherwise execute a
+       Makefile that a pushed or hand-written commit rewrote.
     """
     if ctx.prepared:
         return ctx
@@ -233,19 +263,26 @@ def prepare(
     if fetch:
         ctx.repo.fetch()
     ctx.worktree = _resolve_worktree(ctx, need_state=need_state)
+    ctx.last_error = state_module.read_last_error(ctx.repo.factory_dir, ctx.issue)
     _take_lock(ctx)
+    state_module.clear_last_error(ctx.repo.factory_dir, ctx.issue)
 
     if ctx.worktree is not None:
         wt = ctx.worktree
         if fetch:
             ctx.repo.sync_with_remote(wt, ctx.branch)
-            _push_if_ahead(ctx)
-        _commit_operator_edits(ctx, commit_operator_edits=commit_operator_edits)
+            if State.path(wt, ctx.issue).is_file():
+                _push_if_ahead(ctx)
+        _commit_operator_edits(
+            ctx, commit_operator_edits=commit_operator_edits, strict_clean=strict_clean
+        )
         ctx.state = State.load(wt, ctx.issue) if need_state else State.load_or_none(wt, ctx.issue)
         ctx.ledger = Ledger.load(wt, ctx.issue)
         if ctx.state is not None:
             _check_recorded_commits(ctx)
             ensure_pr(ctx)
+            if check_protected:
+                _refuse_protected_paths(ctx)
     ctx.prepared = True
     return ctx
 
@@ -266,30 +303,29 @@ def _resolve_worktree(ctx: Context, *, need_state: bool) -> Path | None:
 
 def _take_lock(ctx: Context) -> None:
     """Step 3. The lock spans the whole command (deviation 5), so a kill during the gate/commit window is still
-    detected as an interrupted stage."""
+    detected as an interrupted stage.
+
+    Ownership is `is_mine()`, not `pid == getpid()`: on a disposable host the recorded pid can be ours without the
+    process being us (a fresh container, the same pid namespace). A live lock somebody else holds raises with
+    ctx.holds_lock still False, so this command's finally leaves that lock exactly where it is."""
     factory_dir = ctx.repo.factory_dir
     existing = RunLock.read(factory_dir, ctx.issue)
-    if existing is not None and existing.pid != os.getpid():
+    if existing is not None and not existing.is_mine():
         if existing.pid_alive():
             raise FactoryError(
                 f"issue {ctx.issue}: {existing.stage or 'a stage'} in progress (pid {existing.pid})",
                 hint=f"wait for it, or remove {RunLock.path(factory_dir, ctx.issue)} if that process is gone",
             )
-        ctx.last_error = existing.last_error  # into this attempt's stage_note (prompts.py)
+        if existing.last_error:  # the interrupted attempt is the more recent failure
+            ctx.last_error = existing.last_error  # into this attempt's stage_note (prompts.py)
         if ctx.worktree is not None:
             ctx.repo.reset_hard(ctx.worktree)
         ctx.log(
             f"interrupted {existing.stage or 'stage'} discarded; transcript kept "
             f"(worktree reset to HEAD)"
         )
-    RunLock(
-        issue=ctx.issue,
-        stage="",
-        pid=os.getpid(),
-        started_at=state_module.now_iso(),
-        worktree=str(ctx.worktree or ""),
-        last_error=ctx.last_error,
-    ).write(factory_dir)
+    RunLock.create(ctx.issue, "", ctx.worktree or "", ctx.last_error).write(factory_dir)
+    ctx.holds_lock = True
 
 
 def _push_if_ahead(ctx: Context) -> None:
@@ -301,8 +337,11 @@ def _push_if_ahead(ctx: Context) -> None:
         ctx.log(f"could not push {ctx.branch} yet: {exc.message}")
 
 
-def _commit_operator_edits(ctx: Context, *, commit_operator_edits: bool) -> None:
-    """Step 5. Everything dirty is either the operator's work under work/<n>/, a transient, or a reason to stop."""
+def _commit_operator_edits(
+    ctx: Context, *, commit_operator_edits: bool, strict_clean: bool = True
+) -> None:
+    """Step 5. Everything dirty is either the operator's work under work/<n>/, a transient, or a reason to stop —
+    unless strict_clean is False, when a dirty worktree is simply not this command's problem (abandon)."""
     wt = ctx.worktree
     dirty = [
         path
@@ -311,15 +350,16 @@ def _commit_operator_edits(ctx: Context, *, commit_operator_edits: bool) -> None
     ]
     work = _work_rel(ctx.issue)
     outside = [path for path in dirty if not checks_module.is_under(path, [work])]
-    if outside:
+    if outside and strict_clean:
         raise FactoryError(
             f"uncommitted changes outside {work}/ in {wt}: {', '.join(sorted(outside))}",
             hint="commit them on the branch or discard them, then re-run the same command",
         )
-    if not dirty or not commit_operator_edits:
+    under_work = [path for path in dirty if checks_module.is_under(path, [work])]
+    if not under_work or not commit_operator_edits:
         return
     ctx.repo.commit_all(wt, f"factory({ctx.issue}): operator edits", paths=[work])
-    ctx.log(f"committed operator edits under {work}/: {', '.join(sorted(dirty))}")
+    ctx.log(f"committed operator edits under {work}/: {', '.join(sorted(under_work))}")
 
 
 def _check_recorded_commits(ctx: Context) -> None:
@@ -425,6 +465,18 @@ def branch_protected_path_violations(ctx: Context) -> list[str]:
     return [path for path in changed if checks_module.is_protected(path, ctx.config)]
 
 
+def _refuse_protected_paths(ctx: Context) -> None:
+    """branch_protected_path_violations -> FactoryError. Called from prepare() (before any check command runs)
+    and again from run_harness_stage (before every session), because both execute what those files configure."""
+    protected = branch_protected_path_violations(ctx)
+    if protected:
+        raise FactoryError(
+            f"protected paths changed on {ctx.branch}: {', '.join(protected)}",
+            hint="revert them on the branch before another session or check runs (design §9); "
+            "the factory would otherwise run whatever they configure",
+        )
+
+
 def run_harness_stage(
     ctx: Context, *, stage: str, round: int, mode: str, prompt_text: str, schema_name: str
 ) -> tuple[dict, HarnessResult, Path]:
@@ -442,13 +494,7 @@ def run_harness_stage(
     Returns (validated output, HarnessResult, prompt_path rel to worktree) — the caller records metadata and, for write
     stages, passes the prompt path as `ignore` to allowed_edit_violations."""
     wt = _require_worktree(ctx, f"the {stage} stage")
-    protected = branch_protected_path_violations(ctx)
-    if protected:
-        raise FactoryError(
-            f"protected paths changed on {ctx.branch}: {', '.join(protected)}",
-            hint="revert them on the branch before another session runs (design §9); "
-            "the next session would otherwise run whatever they configure",
-        )
+    _refuse_protected_paths(ctx)
 
     prompt_path = prompts.write_prompt(wt, ctx.issue, stage, round, prompt_text)
     prompt_rel = Path(os.path.relpath(prompt_path, wt))
@@ -493,9 +539,18 @@ def run_harness_stage(
                 )
     except BaseException as exc:  # any post-launch failure: reset first, re-raise unchanged
         ctx.repo.reset_hard(wt)
-        _run_lock(ctx, last_error=_error_text(exc))
+        _remember_failure(ctx, _error_text(exc))
         raise
     return result.output, result, prompt_rel
+
+
+def _remember_failure(ctx: Context, message: str) -> str:
+    """Record why this attempt was discarded in BOTH channels (see the module docstring): the RunLock, which
+    survives a kill, and `.factory/run/<issue>.last-error`, which survives the clean exit 1 that clears the lock.
+    prepare() reads them back into ctx.last_error, and _stage_note puts it in the next attempt's prompt."""
+    _run_lock(ctx, last_error=message)
+    state_module.write_last_error(ctx.repo.factory_dir, ctx.issue, message)
+    return message
 
 
 def _transcript_path(ctx: Context, stage: str, round: int) -> Path:
@@ -518,9 +573,11 @@ def _worktree_fingerprint(ctx: Context) -> set[str]:
 def _log_harness_result(
     ctx: Context, stage: str, result: HarnessResult, harness_config: HarnessConfig, mode: str
 ) -> None:
+    # Codex reports no turn count, so "0 turns" would be a fact the transcript contradicts: say nothing.
+    turns = f"{result.num_turns} turns, " if result.num_turns else ""
     ctx.log(
         f"{stage}: {ctx.harness_name} {result.cli_version} finished in {result.duration_s:.0f}s "
-        f"({result.num_turns} turns, transcript {result.transcript_path})"
+        f"({turns}transcript {result.transcript_path})"
     )
     if result.permission_denials:
         tools = ", ".join(
@@ -571,7 +628,10 @@ def commit_and_push(
 ) -> str:
     """state.save + ledger.save; if repo.has_changes(paths) commit_all(paths) else skip the commit; then
     repo.push(force_with_lease = ctx.force_push when None). Returns HEAD. A push failure after the commit leaves the commit
-    local (design §15) and raises FactoryError saying re-running pushes it."""
+    local (design §15) and raises FactoryError saying re-running pushes it.
+
+    A successful push also retires the previous attempt's failure (state.clear_last_error and ctx.last_error): work
+    that reached the branch is not something the next prompt should apologise for."""
     wt = _require_worktree(ctx, "committing")
     state = _require_state(ctx, "committing")
     state.save(wt)
@@ -592,6 +652,8 @@ def commit_and_push(
             hint=f"the commit is local; re-running the same command pushes {ctx.branch}",
         ) from exc
     ctx.force_push = False  # the rewind's single force-with-lease push is spent
+    state_module.clear_last_error(ctx.repo.factory_dir, ctx.issue)
+    ctx.last_error = None
     return head
 
 
@@ -603,7 +665,9 @@ def park(
     stage wrote before the gate — a fresh baseline log, say — from becoming an operator edit that un-parks the issue on
     the next command). Otherwise:
     1. commit evidence_paths first in their own commit (e.g. checks/build-1-baseline.log: "factory(N): build baseline (red)")
-    2. outcome_sha = HEAD (after 1); state.set_outcome(f"needs_human:{gate}", outcome_sha)
+    2. outcome_sha = HEAD (after 1); state.set_outcome(f"needs_human:{gate}", outcome_sha); for a REVIEW_LOOP_GATES
+       gate also state.mark_last_review_gated(), so the state-only commit carries the flag `run` reads back: the
+       operator's answer to those gates (a dismiss, a hand fix) has to be REVIEWED, not fixed
     3. commit ONLY work/<n>/state.json ("factory(N): park <gate>"); push
     4. ensure_pr; gh.pr_comment(render_gate_comment(...), marker=GATE_MARKER(gate, outcome_sha)) when a PR exists
     5. raise NeedsHuman(gate, what_clears_it)."""
@@ -624,9 +688,12 @@ def park(
         evidence = ", ".join(evidence_paths) if evidence_paths else work
         ctx.repo.commit_all(wt, f"factory({ctx.issue}): {gate} evidence ({evidence})", paths=[work])
 
-    # 2. outcome_sha is HEAD *before* the state-only commit (state.is_parked's second clause).
+    # 2. outcome_sha is HEAD *before* the state-only commit (state.is_parked's second clause). The gated flag is
+    #    set here, after the evidence commit, so it travels in that same state-only commit.
     outcome_sha = ctx.repo.head(wt)
     state.set_outcome(f"needs_human:{gate}", outcome_sha)
+    if gate in REVIEW_LOOP_GATES:
+        state.mark_last_review_gated()
     state.save(wt)
     _assert_only_state_dirty(ctx)
     commit_and_push(
@@ -754,7 +821,10 @@ def rewind_for_force(ctx: Context, stage: str) -> None:
        spec_open_questions, spec_accepted (spec --force drops these two) and stages BEFORE `stage`; drop stages[stage] and
        later, reviews, fix_rounds, outcome, outcome_sha; ledger = empty (findings.json removed)
     4. state.save; commit "factory(N): operator edits before <stage> --force" if anything changed
-    5. ctx.force_push = True. Never pushes itself — the stage's single push at the end is the force-with-lease push."""
+    5. push the rewound branch immediately with --force-with-lease, and leave ctx.force_push = True for the stage's
+       own final push. The rewind is what the operator asked for; publishing it at once means the draft PR shows the
+       branch that is actually being rebuilt, and a stage that then fails a gate leaves origin == the local tip
+       instead of a remote that is ahead of us and would need a second --force to reconcile."""
     if stage not in STAGE_ORDER:
         raise FactoryError(
             f"--force is not supported for {stage}; only {', '.join(STAGE_ORDER)} rewind"
@@ -794,6 +864,9 @@ def rewind_for_force(ctx: Context, stage: str) -> None:
         ctx.repo.commit_all(wt, f"factory({ctx.issue}): operator edits before {stage} --force")
     ctx.force_push = True
     ctx.log(f"{stage} --force: rewound {ctx.branch} to {target[:12]} (was {old_head[:12]})")
+    if ctx.repo.remote_branch_exists(ctx.branch):
+        ctx.repo.push(wt, ctx.branch, force_with_lease=True)
+        ctx.log(f"{stage} --force: pushed the rewound {ctx.branch} (force-with-lease)")
 
 
 def _gate_failure(
@@ -801,8 +874,26 @@ def _gate_failure(
 ) -> None:
     """A deterministic gate rejected the stage: reset the worktree (design §15), remember why, exit 1."""
     ctx.repo.reset_hard(_require_worktree(ctx, "the gate"))
-    _run_lock(ctx, last_error=message)
+    _remember_failure(ctx, message)
     raise GateViolation(message, paths, hint)
+
+
+@contextlib.contextmanager
+def _after_the_session(ctx: Context) -> Iterator[None]:
+    """Everything a write or review stage does AFTER run_harness_stage returned, so that no failure can leave the
+    session's edits in the worktree (design §15 / deviation 6: "re-run the same command" must never meet "worktree
+    dirty"). The gates call _gate_failure themselves; this catches the OTHER FactoryErrors of that window — a
+    ledger merge that rejects the reviewer's output, an unwritable artifact, a check command factory.toml spells
+    wrong, a push that fails — and routes them through the same reset-and-remember path.
+
+    GateViolation passes through untouched: _gate_failure and run_harness_stage have already reset for it, and
+    resetting twice would only widen the window in which the worktree is being rewritten."""
+    try:
+        yield
+    except GateViolation:
+        raise
+    except FactoryError as exc:
+        _gate_failure(ctx, exc.message, paths=getattr(exc, "paths", None) or None, hint=exc.hint)
 
 
 # ---------------------------------------------------------------- stages
@@ -811,7 +902,7 @@ def _gate_failure(
 def spec(ctx: Context) -> None:
     """Design §9 row `spec` (mode read):
     - if stages.spec recorded: not force -> log "spec already done", return; force -> rewind_for_force(ctx, "spec")
-    - base_sha = repo.base_sha(config.base_branch); snapshot issue via gh.issue (the stage's one GitHub read);
+    - base_sha = _spec_base_sha(ctx, rewound); snapshot issue via gh.issue (the stage's one GitHub read);
       intent_md, sha = state.render_intent(...)
     - worktree = repo.ensure_worktree(issue, start_point=base_sha) if ctx.worktree is None; ctx.worktree = it
     - initial State(issue={number, snapshot_sha256, snapshot_at}, base={branch, sha}, branch); write intent.md
@@ -830,8 +921,7 @@ def spec(ctx: Context) -> None:
         rewind_for_force(ctx, "spec")
         rewound = True
 
-    # A --force re-run keeps the base the branch was cut from; a first run reads it from origin.
-    base_sha = ctx.state.base["sha"] if rewound else ctx.repo.base_sha(ctx.config.base_branch)
+    base_sha = _spec_base_sha(ctx, rewound=rewound)
     snapshot_at = state_module.now_iso()
     issue = ctx.gh.issue(ctx.issue)
     intent_md, digest = state_module.render_intent(issue.to_dict(), snapshot_at)
@@ -880,6 +970,34 @@ def spec(ctx: Context) -> None:
 
     if ctx.state.spec_needs_acceptance():
         park(ctx, "open_questions", what_clears("open_questions", ctx))
+
+
+def _spec_base_sha(ctx: Context, *, rewound: bool) -> str:
+    """`state.base['sha']` — the commit the whole run diffs against, and the only thing that keeps the
+    protected-path check and the review diff talking about this branch.
+
+    Only the path that CREATES the branch may read `origin/<base>`: if the branch already exists (a first `spec`
+    that was interrupted after `git worktree add` and before its commit, then re-run) origin may have moved on,
+    and a base that is not an ancestor of the branch would make `git diff base HEAD` report every commit that
+    landed on the base branch meanwhile as a change of this run's. So an existing branch reports what it was cut
+    from: `origin/<base>` when it is still an ancestor of the tip, else the tip itself."""
+    if rewound:
+        return str(_require_state(ctx, "spec --force").base["sha"])
+    if ctx.worktree is None:
+        return ctx.repo.base_sha(ctx.config.base_branch)  # spec is about to create the branch
+    if ctx.state is not None and ctx.state.base.get("sha"):
+        return str(ctx.state.base["sha"])
+    tip = ctx.repo.head(ctx.worktree)
+    base_branch = ctx.config.base_branch
+    if ctx.repo.remote_branch_exists(base_branch) and ctx.repo.is_ancestor(
+        f"origin/{base_branch}", tip, ctx.worktree
+    ):
+        return ctx.repo.rev_parse(f"origin/{base_branch}", ctx.worktree)
+    ctx.log(
+        f"{ctx.branch} already exists with no state.json; using its tip {tip[:12]} as the base "
+        f"(origin/{base_branch} is not an ancestor of it)"
+    )
+    return tip
 
 
 def accept(ctx: Context) -> None:
@@ -1002,49 +1120,66 @@ def build(ctx: Context) -> None:
         ctx, stage="build", round=1, mode="write", prompt_text=prompt, schema_name="build"
     )
 
-    changed = ctx.repo.changed_paths_in_worktree(wt)
-    violations = checks_module.allowed_edit_violations(
-        changed, stage="build", issue=ctx.issue, config=ctx.config, ignore=[prompt_rel.as_posix()]
-    )
-    if violations:
-        _gate_failure(
-            ctx,
-            f"build changed paths it may not touch: {', '.join(violations)}",
-            paths=violations,
-            hint="protected paths and everything under work/ except plan.md are off limits (design §9); "
-            "make those edits by hand, commit, and re-run",
+    with _after_the_session(ctx):
+        changed = ctx.repo.changed_paths_in_worktree(wt)
+        violations = checks_module.allowed_edit_violations(
+            changed,
+            stage="build",
+            issue=ctx.issue,
+            config=ctx.config,
+            ignore=[prompt_rel.as_posix()],
         )
-    missing = checks_module.paths_missing_from_plan(
-        changed, _read_work_file(ctx, "plan.md"), issue=ctx.issue
-    )
-    if missing:
-        _gate_failure(
-            ctx,
-            f"build changed paths that work/{ctx.issue}/plan.md does not list: {', '.join(missing)}",
-            paths=missing,
-            hint="list every changed path verbatim under '## Files that change' in plan.md "
-            "(the build role is told to update the plan in the same pass)",
+        if violations:
+            _gate_failure(
+                ctx,
+                f"build changed paths it may not touch: {', '.join(violations)}",
+                paths=violations,
+                hint="protected paths and everything under work/ except plan.md are off limits (design §9); "
+                "make those edits by hand, commit, and re-run",
+            )
+        missing = checks_module.paths_missing_from_plan(
+            changed, _read_work_file(ctx, "plan.md"), issue=ctx.issue
         )
-    verdict = _run_checks(ctx)
-    if not verdict.ok:
-        _keep_check_log(ctx, "build", 1, verdict.log, near=result.transcript_path)
-        _gate_failure(
-            ctx,
-            f"checks failed after build: {', '.join(verdict.failed)}",
-            hint=f"the output is next to the transcript {result.transcript_path}",
-        )
+        if missing:
+            _gate_failure(
+                ctx,
+                f"build changed paths that work/{ctx.issue}/plan.md does not list: {', '.join(missing)}",
+                paths=missing,
+                hint="list every changed path verbatim under '## Files that change' in plan.md "
+                "(the build role is told to update the plan in the same pass)",
+            )
+        verdict = _run_checks(ctx)
+        if not verdict.ok:
+            _keep_check_log(ctx, "build", 1, verdict.log, near=result.transcript_path)
+            _gate_failure(
+                ctx,
+                f"checks failed after build: {', '.join(verdict.failed)}",
+                hint=f"the output is next to the transcript {result.transcript_path}",
+            )
 
-    checks_module.write_check_log(wt, ctx.issue, "build", 1, verdict.log)
-    _write_work_file(ctx, "build-1.json", json.dumps(out, indent=2) + "\n")
-    if out.get("deviations"):
-        ctx.log(f"build reported {len(out['deviations'])} deviation(s) from the plan")
-    record_stage(ctx, "build", result, start_commit)
-    commit_and_push(ctx, f"factory({ctx.issue}): build")
+        checks_module.write_check_log(wt, ctx.issue, "build", 1, verdict.log)
+        _write_work_file(ctx, "build-1.json", json.dumps(out, indent=2) + "\n")
+        if out.get("deviations"):
+            ctx.log(f"build reported {len(out['deviations'])} deviation(s) from the plan")
+        record_stage(ctx, "build", result, start_commit)
+        commit_and_push(ctx, f"factory({ctx.issue}): build")
 
 
 def _run_checks(ctx: Context) -> checks_module.CheckRun:
+    """The configured checks over a tree the last session cannot have poisoned.
+
+    `git add -A` first, so the index describes exactly what the stage produced, and then remove every IGNORED
+    untracked file except `.factory/` (repo.clean_ignored): `.venv/`, `node_modules/`, `__pycache__` — the
+    droppings a write stage's `Bash(uv *)`/`Bash(make *)` leaves behind, none of which `git status` would ever
+    show. A builder that edited `.venv/bin/pytest` (or left a stale `.pyc` shadowing a module it deleted) would
+    otherwise be running the check on its own tooling; the toolchain rebuilds what it needs. `.factory/` stays
+    because the review diff and the transcripts live there (deviation 11). Used for the baseline, build, fix and
+    finalize check runs alike."""
+    wt = _require_worktree(ctx, "the checks")
+    ctx.repo.stage_all(wt)
+    ctx.repo.clean_ignored(wt)
     return checks_module.run_checks(
-        ctx.worktree, ctx.config, checks_env(ctx.harness_env), ctx.config.stage_timeout_s
+        wt, ctx.config, checks_env(ctx.harness_env), ctx.config.stage_timeout_s
     )
 
 
@@ -1163,37 +1298,41 @@ def review(ctx: Context) -> None:
         ctx, stage="review", round=round, mode="read", prompt_text=prompt, schema_name="review"
     )
 
-    candidate, stats = ctx.ledger.merged_copy(out, round)
-    if stats.missing_updates:
-        _gate_failure(
-            ctx,
-            f"review {round} gave no update for open finding(s): {', '.join(stats.missing_updates)}",
-            paths=list(stats.missing_updates),
-            hint="every finding the ledger marks NEEDS UPDATE needs exactly one entry in `updates` (design §9)",
-        )
-    if stats.new_nits > ctx.config.max_nits:
-        _gate_failure(
-            ctx,
-            f"review {round} raised {stats.new_nits} new nits, above the cap of {ctx.config.max_nits}",
-            hint="tighten REVIEW.md's skip list or raise [factory] max_nits",
-        )
+    with _after_the_session(ctx):
+        # merged_copy validates the reviewer's own entries: a finding with no title or an unknown severity is a
+        # FactoryError, and it must reset the worktree like any other rejected round (the read stage wrote the
+        # diff into .factory/tmp, which the reset keeps).
+        candidate, stats = ctx.ledger.merged_copy(out, round)
+        if stats.missing_updates:
+            _gate_failure(
+                ctx,
+                f"review {round} gave no update for open finding(s): {', '.join(stats.missing_updates)}",
+                paths=list(stats.missing_updates),
+                hint="every finding the ledger marks NEEDS UPDATE needs exactly one entry in `updates` (design §9)",
+            )
+        if stats.new_nits > ctx.config.max_nits:
+            _gate_failure(
+                ctx,
+                f"review {round} raised {stats.new_nits} new nits, above the cap of {ctx.config.max_nits}",
+                hint="tighten REVIEW.md's skip list or raise [factory] max_nits",
+            )
 
-    ctx.ledger = candidate
-    _write_work_file(ctx, f"review-{round}.json", json.dumps(out, indent=2) + "\n")
-    open_important = len(candidate.open_important())
-    state.reviews.append(
-        ReviewRecord(
-            round=round,
-            sha=reviewed,
-            important_open=open_important,
-            important_resolved=stats.resolved,
-            nits=stats.new_nits,
-            reraised_dropped=stats.reraised_dropped,
-            fix_rounds_at=state.fix_rounds,
-            diff_truncated=truncated,
+        ctx.ledger = candidate
+        _write_work_file(ctx, f"review-{round}.json", json.dumps(out, indent=2) + "\n")
+        open_important = len(candidate.open_important())
+        state.reviews.append(
+            ReviewRecord(
+                round=round,
+                sha=reviewed,
+                important_open=open_important,
+                important_resolved=stats.resolved,
+                nits=stats.new_nits,
+                reraised_dropped=stats.reraised_dropped,
+                fix_rounds_at=state.fix_rounds,
+                diff_truncated=truncated,
+            )
         )
-    )
-    commit_and_push(ctx, f"factory({ctx.issue}): review {round}")
+        commit_and_push(ctx, f"factory({ctx.issue}): review {round}")
     ctx.log(
         f"review {round}: {open_important} Important open, {stats.resolved} resolved, "
         f"{stats.new_nits} new nit(s), {stats.reraised_dropped} re-raised and dropped"
@@ -1291,38 +1430,39 @@ def fix(ctx: Context) -> None:
         ctx, stage="fix", round=round, mode="write", prompt_text=prompt, schema_name="fix"
     )
 
-    violations = checks_module.allowed_edit_violations(
-        ctx.repo.changed_paths_in_worktree(wt),
-        stage="fix",
-        issue=ctx.issue,
-        config=ctx.config,
-        ignore=[prompt_rel.as_posix()],
-    )
-    if violations:
-        _gate_failure(
-            ctx,
-            f"fix {round} changed paths it may not touch: {', '.join(violations)}",
-            paths=violations,
-            hint="a fixer may not edit tests, protected paths, or anything under work/ (design §9)",
+    with _after_the_session(ctx):
+        violations = checks_module.allowed_edit_violations(
+            ctx.repo.changed_paths_in_worktree(wt),
+            stage="fix",
+            issue=ctx.issue,
+            config=ctx.config,
+            ignore=[prompt_rel.as_posix()],
         )
-    verdict = _run_checks(ctx)
-    if not verdict.ok:
-        _keep_check_log(ctx, "fix", round, verdict.log, near=result.transcript_path)
-        _gate_failure(
-            ctx,
-            f"checks failed after fix {round}: {', '.join(verdict.failed)}",
-            hint=f"the output is next to the transcript {result.transcript_path}",
-        )
+        if violations:
+            _gate_failure(
+                ctx,
+                f"fix {round} changed paths it may not touch: {', '.join(violations)}",
+                paths=violations,
+                hint="a fixer may not edit tests, protected paths, or anything under work/ (design §9)",
+            )
+        verdict = _run_checks(ctx)
+        if not verdict.ok:
+            _keep_check_log(ctx, "fix", round, verdict.log, near=result.transcript_path)
+            _gate_failure(
+                ctx,
+                f"checks failed after fix {round}: {', '.join(verdict.failed)}",
+                hint=f"the output is next to the transcript {result.transcript_path}",
+            )
 
-    checks_module.write_check_log(wt, ctx.issue, "fix", round, verdict.log)
-    _write_work_file(ctx, f"fix-{round}.json", json.dumps(out, indent=2) + "\n")
-    state.fix_rounds = round
-    not_addressed = out.get("not_addressed") or []
-    if not_addressed:
-        ctx.log(
-            f"fix {round} left {len(not_addressed)} finding(s) unaddressed; the next review adjudicates"
-        )
-    commit_and_push(ctx, f"factory({ctx.issue}): fix {round}")
+        checks_module.write_check_log(wt, ctx.issue, "fix", round, verdict.log)
+        _write_work_file(ctx, f"fix-{round}.json", json.dumps(out, indent=2) + "\n")
+        state.fix_rounds = round
+        not_addressed = out.get("not_addressed") or []
+        if not_addressed:
+            ctx.log(
+                f"fix {round} left {len(not_addressed)} finding(s) unaddressed; the next review adjudicates"
+            )
+        commit_and_push(ctx, f"factory({ctx.issue}): fix {round}")
 
 
 def _previous_not_addressed(ctx: Context, round: int) -> str:
@@ -1348,8 +1488,10 @@ def _previous_not_addressed(ctx: Context, round: int) -> str:
 def finalize(ctx: Context) -> None:
     """Parked -> re-raise the recorded gate (§11) before the checks run.
     Requires: at least one review; open Important == 0 (else FactoryError naming them: "dismiss or fix them");
-    no code change since reviews[-1].sha (else FactoryError "run `factory review N`"). outcome == "done" and nothing
-    changed -> log "already finalized", still re-run the idempotent gh steps, return.
+    no code change since reviews[-1].sha (else FactoryError "run `factory review N`"). outcome == "done" and no code
+    change since outcome_sha -> log "already finalized", still re-run the idempotent gh steps, return. (The
+    comparison is against outcome_sha, not the last review: an operator commit AFTER a finished run is reviewed by
+    `run` and must then be checked and finalized again, not waved through as already done.)
     Checks green (§11): run_checks(...); red -> GateViolation naming the failing command (PR stays draft). Green:
     write_check_log("finalize", 1); state.set_outcome("done", HEAD); commit_and_push("factory(N): finalize");
     ensure_pr(required=True); gh.pr_ready; gh.pr_comment(render_summary_comment(...), marker=SUMMARY_MARKER(HEAD)).
@@ -1376,25 +1518,36 @@ def finalize(ctx: Context) -> None:
             hint=f"run `factory review {ctx.issue}` before finalizing",
         )
 
-    if state.outcome == "done":
+    if state.outcome == "done" and not _code_changed_since_finalize(ctx):
         ctx.log("already finalized")
         _finalize_github(ctx, state.outcome_sha or ctx.repo.head(wt))
         return
 
-    verdict = _run_checks(ctx)
-    if not verdict.ok:
-        log_path = _keep_check_log(ctx, "finalize", 1, verdict.log)
-        _gate_failure(
-            ctx,
-            f"checks failed at finalize: {', '.join(verdict.failed)}",
-            hint=f"the pull request stays a draft until they are green; the output is at {log_path}",
-        )
-    checks_module.write_check_log(wt, ctx.issue, "finalize", 1, verdict.log)
-    done_sha = ctx.repo.head(wt)
-    state.set_outcome("done", done_sha)
-    commit_and_push(ctx, f"factory({ctx.issue}): finalize")
+    with _after_the_session(ctx):
+        verdict = _run_checks(ctx)
+        if not verdict.ok:
+            log_path = _keep_check_log(ctx, "finalize", 1, verdict.log)
+            _gate_failure(
+                ctx,
+                f"checks failed at finalize: {', '.join(verdict.failed)}",
+                hint=f"the pull request stays a draft until they are green; the output is at {log_path}",
+            )
+        checks_module.write_check_log(wt, ctx.issue, "finalize", 1, verdict.log)
+        done_sha = ctx.repo.head(wt)
+        state.set_outcome("done", done_sha)
+        commit_and_push(ctx, f"factory({ctx.issue}): finalize")
     _finalize_github(ctx, done_sha)
     ctx.log(f"issue {ctx.issue} is done; the pull request is ready for human review")
+
+
+def _code_changed_since_finalize(ctx: Context) -> bool:
+    """True when HEAD carries code the finished run never checked — an operator commit after `outcome: done`.
+    Without an outcome_sha (a state file written before one was recorded) nothing can be compared, so the run
+    counts as finished."""
+    state, wt = ctx.state, ctx.worktree
+    if not state.outcome_sha:
+        return False
+    return ctx.repo.code_changed_between(wt, state.outcome_sha, "HEAD")
 
 
 def _finalize_github(ctx: Context, sha: str) -> None:
@@ -1419,11 +1572,23 @@ def run(ctx: Context) -> None:
       not stages.spec -> spec; spec_needs_acceptance -> park(open_questions) [spec itself parks]
       not stages.plan -> plan; not stages.build -> build; no reviews -> review
       while ledger.open_important():
+        the last review is stale — it is `gated` (it raised no_progress/rounds_exhausted) or code changed since
+          reviews[-1].sha -> review, and start the loop again
         no_progress(state) -> park("no_progress", ...)
         fix_rounds >= max_fix_rounds -> park("rounds_exhausted", <list of open Important ids and titles>)
-        code_changed_between(reviews[-1].sha, HEAD) -> review (operator hand-fixed) else fix then review
-      outcome == "done" and no code change since reviews[-1].sha -> log "already finalized", return
-      finalize."""
+        else fix then review
+      code changed since reviews[-1].sha (a `gated` review is not enough here: the gate was about findings, and
+        none are open) -> review it, then re-enter the loop if that reopened Important findings
+      outcome == "done" and no code change since outcome_sha -> log "already finalized", return
+      finalize.
+
+    Why the stale-review test comes FIRST (design §11, "only your action re-opens the loop"): every operator
+    action moves HEAD, but only some of them touch code. A hand fix changes code; `dismiss` and `accept` change
+    only work/. Deciding on `code_changed` alone would therefore re-park a dismissal on the very gate the
+    dismissal answered, and the run could never move again. `ReviewRecord.gated` closes that: the review the gate
+    was raised over cannot also be the review that justifies the next fix or the next park — it has to be redone
+    over what the operator did. Each operator action buys exactly one review, and if that review still leaves
+    Important findings open with no progress or no rounds left, the gate comes back."""
     ctx.force = False  # `run` never rewinds; --force is a per-stage operator action (design §6)
     if ctx.worktree is None or ctx.state is None:
         spec(ctx)
@@ -1441,23 +1606,57 @@ def run(ctx: Context) -> None:
     if not state.reviews:
         review(ctx)
 
-    while ctx.ledger.open_important():
-        if state_module.no_progress(state):
-            park(ctx, "no_progress", what_clears("no_progress", ctx))
-        if state.fix_rounds >= ctx.config.max_fix_rounds:
-            park(ctx, "rounds_exhausted", what_clears("rounds_exhausted", ctx))
-        if ctx.repo.code_changed_between(ctx.worktree, state.reviews[-1].sha, "HEAD"):
-            ctx.log("code changed since the last review; reviewing it before fixing")
-        else:
+    while True:
+        while ctx.ledger.open_important():
+            if _review_is_stale(ctx, before="fixing"):
+                review(ctx)
+                continue
+            if state_module.no_progress(state):
+                park(ctx, "no_progress", what_clears("no_progress", ctx))
+            if state.fix_rounds >= ctx.config.max_fix_rounds:
+                park(ctx, "rounds_exhausted", what_clears("rounds_exhausted", ctx))
             fix(ctx)
+            review(ctx)
+        if not _unreviewed_code(ctx):
+            break
+        # No Important finding is open, but HEAD carries code the last review never saw: an operator commit
+        # after it has to be adjudicated, and finalize would otherwise refuse this HEAD for ever. A `gated`
+        # review is NOT a reason to come back here — the gate was about open findings, and none are.
+        ctx.log("code changed since the last review; reviewing it before finalizing")
         review(ctx)
 
-    if state.outcome == "done" and not ctx.repo.code_changed_between(
-        ctx.worktree, state.reviews[-1].sha, "HEAD"
-    ):
+    if state.outcome == "done" and not _code_changed_since_finalize(ctx):
         ctx.log("already finalized")
         return
     finalize(ctx)
+
+
+def _review_is_stale(ctx: Context, *, before: str) -> bool:
+    """True when reviews[-1] cannot decide what happens next: it raised the gate the operator has since answered
+    (ReviewRecord.gated), or it reviewed a commit whose code HEAD no longer matches. Either way the next step is
+    another review, and `before` names what that review comes before in the log line. False when no review has run
+    at all — `run` reviews first in that case anyway."""
+    last = ctx.state.last_review() if ctx.state else None
+    if last is None:
+        return False
+    if last.gated:
+        ctx.log(
+            f"review {last.round} raised the gate you answered; reviewing your change before {before}"
+        )
+        return True
+    if _unreviewed_code(ctx):
+        ctx.log(f"code changed since the last review; reviewing it before {before}")
+        return True
+    return False
+
+
+def _unreviewed_code(ctx: Context) -> bool:
+    """True when HEAD's code differs from the commit the last review looked at — an operator hand fix, or a
+    commit pushed from elsewhere and fast-forwarded in. False when no review has run."""
+    last = ctx.state.last_review() if ctx.state else None
+    if last is None:
+        return False
+    return ctx.repo.code_changed_between(ctx.worktree, last.sha, "HEAD")
 
 
 def run_issue(
@@ -1465,9 +1664,13 @@ def run_issue(
 ) -> int:
     """Builds a fresh Context for one issue, prepare(need_state=False), run(); maps to an exit code: 0 normal,
     2 NeedsHuman, 1 FactoryError (message + transcript path logged via out); unexpected exceptions -> 1 with traceback
-    logged. Never raises. Clears the RunLock in a finally. cli.py passes this to poll as run_issue and uses it for
-    `factory run`."""
+    logged. Never raises except KeyboardInterrupt, which propagates to cli.main.
+
+    In a finally it clears the RunLock, but only the one this process took (ctx.holds_lock + clear_if_owned: a live
+    lock another container holds is not ours to remove) and never after an interrupt — the dying pid is precisely
+    what tells the next command that this stage was interrupted (design §7, §15)."""
     ctx = Context(repo=repo, gh=gh, config=config, issue=issue, parent_env=parent_env, out=out)
+    interrupted = False
     try:
         prepare(ctx, need_state=False)
         run(ctx)
@@ -1484,11 +1687,15 @@ def run_issue(
         if transcript:
             ctx.log(f"transcript: {transcript}")
         return 1
+    except KeyboardInterrupt:
+        interrupted = True
+        raise
     except Exception:
         ctx.log(f"issue {issue} failed unexpectedly:\n{traceback.format_exc().rstrip()}")
         return 1
     finally:
-        RunLock.clear(repo.factory_dir, issue)
+        if ctx.holds_lock and not interrupted:
+            RunLock.clear_if_owned(repo.factory_dir, issue)
 
 
 def status(ctx: Context) -> str:
@@ -1602,7 +1809,10 @@ def _close_pr(ctx: Context) -> None:
 
 
 def _forget_issue(ctx: Context) -> None:
+    """Every host-local trace of the issue: the lock (unconditionally — the run is over), the recorded
+    last error, and the issue's entry in the poll journal."""
     RunLock.clear(ctx.repo.factory_dir, ctx.issue)
+    state_module.clear_last_error(ctx.repo.factory_dir, ctx.issue)
     journal = state_module.read_poll_journal(ctx.repo.factory_dir)
     if journal.pop(str(ctx.issue), None) is not None:
         state_module.write_poll_journal(ctx.repo.factory_dir, journal)

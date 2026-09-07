@@ -10,6 +10,9 @@ The design keys "did the operator act?" on HEAD moving. The factory's *own* comm
                             sha). The artifact commit itself is the next commit that touches work/<n>/state.json;
                             it is never needed for control flow (a commit cannot contain its own sha).
   reviews[-1].sha         = the commit that was REVIEWED (HEAD before the review-record commit).
+  reviews[-1].gated       = that review raised a review-loop gate (no_progress or rounds_exhausted). It survives
+                            the park, so when an operator action un-parks the issue `run` reviews the operator's
+                            work instead of fixing over an unreviewed HEAD (State.mark_last_review_gated).
   "HEAD is the reviewed commit" (fix precondition, finalize precondition, run's review-vs-fix switch) means:
                             no diff outside work/ between reviews[-1].sha and HEAD (Repo.code_changed_between is
                             False). Deliberate divergence from §6's literal "HEAD moved": an accept/dismiss commit
@@ -149,6 +152,9 @@ class ReviewRecord:
         0  # state.fix_rounds when this review ran; no_progress() compares consecutive rounds
     )
     diff_truncated: bool = False
+    gated: bool = (
+        False  # this review raised no_progress/rounds_exhausted; see State.mark_last_review_gated
+    )
 
 
 def _stage_from_dict(name: str, d) -> StageRecord:
@@ -184,6 +190,7 @@ def _review_from_dict(index: int, d) -> ReviewRecord:
         reraised_dropped=_opt_int(d.get("reraised_dropped")) or 0,
         fix_rounds_at=_opt_int(d.get("fix_rounds_at")) or 0,
         diff_truncated=bool(d.get("diff_truncated")),
+        gated=bool(d.get("gated")),  # absent in state files written before the field existed
     )
 
 
@@ -296,6 +303,15 @@ class State:
 
     def last_review(self) -> ReviewRecord | None:
         return self.reviews[-1] if self.reviews else None
+
+    def mark_last_review_gated(self) -> None:
+        """Record that reviews[-1] is the review that raised a review-loop gate (no_progress or
+        rounds_exhausted). `run` reads it back: an un-parked issue whose last review is gated must be REVIEWED
+        again rather than fixed, because the operator's action (a hand fix, an accept, a dismiss) has not been
+        reviewed and the gate was raised over that review's findings. No-op when no review has run yet — the
+        open_questions and baseline_failing gates park before the first review."""
+        if self.reviews:
+            self.reviews[-1].gated = True
 
     def stage_done(self, stage: str) -> bool:
         return stage in self.stages
@@ -773,13 +789,58 @@ def parse_open_questions(spec_md: str) -> list[str]:
 # ---------------------------------------------------------------- host-local transients (design §7)
 
 
+BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+_PID_STAT_STARTTIME = 22  # field 22 of /proc/<pid>/stat, counted from 1 (see proc(5))
+
+
+def current_boot_id() -> str:
+    """`/proc/sys/kernel/random/boot_id`, stripped — one value per kernel boot, shared by every container on
+    the host. "" when /proc is unreadable (a non-Linux workstation, a stripped sandbox): unknown, not zero."""
+    try:
+        return BOOT_ID_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def pid_start_time(pid: int) -> str:
+    """Field 22 (`starttime`, clock ticks since boot) of `/proc/<pid>/stat` for `pid`; "" when unreadable.
+
+    Together with the boot id this distinguishes a process from a later one that reused its pid. Field 2
+    (`comm`) is parenthesised and may contain spaces and parentheses, so the fields are counted from after the
+    LAST ')': that first token is field 3."""
+    try:
+        stat = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return ""
+    fields = stat.rpartition(")")[2].split()
+    index = _PID_STAT_STARTTIME - 3
+    return fields[index] if len(fields) > index else ""
+
+
+def _same_identity(recorded: str, live: str) -> bool:
+    """Two identity fields agree unless BOTH are known and differ; "" means this host could not tell, which is
+    never evidence of a mismatch (the check then degrades to the bare pid comparison it strengthens)."""
+    return not recorded or not live or recorded == live
+
+
 @dataclass
 class RunLock:
-    """`.factory/run/<issue>.json`: in-flight stage, pid, started_at, worktree path.
-    Presence with a live pid is the per-issue lock; a dead pid means an interrupted stage.
+    """`.factory/run/<issue>.json`: in-flight stage, pid, started_at, worktree path, and the writing pid's
+    identity. Presence with a live pid is the per-issue lock; a dead pid means an interrupted stage.
 
-    `last_error` carries the previous attempt's failure into the next attempt's stage_note (prompts.py);
-    it is written by whoever holds the lock and read back by prepare() after an interrupted stage.
+    **Why a pid is not enough** (design §13): unattended mode runs every poll tick in a fresh container on a
+    disposable host, so pids repeat — pid 7 in this tick is not the pid 7 that died mid-stage in the last one,
+    and treating it as alive would wedge the issue behind a lock nobody holds. `boot_id` (one value per kernel
+    boot) and `pid_start` (the pid's start time, field 22 of `/proc/<pid>/stat`) pin the writer:
+    `pid_alive()` calls a lock live only when the process now holding that pid is the one that wrote it, and
+    `is_mine()` — the precondition of `clear_if_owned()` — only when that process is THIS one. Either field
+    is "" when /proc is unreadable, and an empty side never contradicts the other.
+
+    **Two error channels, deliberately separate.** `last_error` in this file carries the failure of an
+    INTERRUPTED attempt: the process was killed with the lock held, the file outlived it, and prepare() reads
+    it back into the next attempt's stage_note (prompts.py). It cannot carry an ordinary exit 1, because
+    cli.py clears the lock at the end of every command — that is what `.factory/run/<issue>.last-error`
+    (`write_last_error`/`read_last_error` below) is for.
     """
 
     issue: int
@@ -788,13 +849,36 @@ class RunLock:
     started_at: str
     worktree: str
     last_error: str | None = None
+    boot_id: str = ""  # "" in locks written before the field existed, and where /proc is unreadable
+    pid_start: str = ""
 
     @staticmethod
     def path(factory_dir: Path, issue: int) -> Path:
         return factory_dir / "run" / f"{issue}.json"
 
     @classmethod
+    def create(
+        cls, issue: int, stage: str, worktree: Path | str, last_error: str | None = None
+    ) -> RunLock:
+        """The lock for THIS process, stamped with pid, started_at and the pid identity (`boot_id`,
+        `pid_start`) that `is_mine()` and `pid_alive()` check. Every lock the factory writes is built here;
+        constructing one by hand leaves the identity empty and weakens both checks to the bare pid."""
+        pid = os.getpid()
+        return cls(
+            issue=int(issue),
+            stage=str(stage or ""),
+            pid=pid,
+            started_at=now_iso(),
+            worktree=str(worktree or ""),
+            last_error=last_error,
+            boot_id=current_boot_id(),
+            pid_start=pid_start_time(pid),
+        )
+
+    @classmethod
     def read(cls, factory_dir: Path, issue: int) -> RunLock | None:
+        """The lock file, or None when it is absent, unreadable or holds no pid. A file written before
+        `boot_id`/`pid_start` existed loads with both empty (unknown identity)."""
         data = _read_json_map(RunLock.path(factory_dir, issue))
         if not data or _opt_int(data.get("pid")) is None:
             return None
@@ -805,6 +889,8 @@ class RunLock:
             started_at=str(data.get("started_at") or ""),
             worktree=str(data.get("worktree") or ""),
             last_error=data.get("last_error"),
+            boot_id=str(data.get("boot_id") or ""),
+            pid_start=str(data.get("pid_start") or ""),
         )
 
     def write(self, factory_dir: Path, *, stage: str | None = None) -> None:
@@ -814,6 +900,8 @@ class RunLock:
 
     @staticmethod
     def clear(factory_dir: Path, issue: int) -> None:
+        """Unconditional removal, whoever wrote it: `abandon`'s cleanup and tests. Command ends use
+        `clear_if_owned` so a container cannot delete another container's live lock."""
         try:
             RunLock.path(factory_dir, issue).unlink(missing_ok=True)
         except OSError as exc:
@@ -821,8 +909,39 @@ class RunLock:
                 f"could not clear {RunLock.path(factory_dir, issue)}: {exc}"
             ) from exc
 
+    @staticmethod
+    def clear_if_owned(factory_dir: Path, issue: int) -> bool:
+        """Remove the lock only when this process wrote it (`is_mine()`) or it is already gone; return whether
+        the file is gone afterwards. A lock this process cannot prove is its own is left alone — it belongs to
+        a concurrent command, or to a writer whose identity is unreadable — and False says so. An unlink that
+        fails leaves the file and returns False rather than raising: the caller is cli.py's finally, where a
+        raise would replace the command's own error."""
+        path = RunLock.path(factory_dir, issue)
+        lock = RunLock.read(factory_dir, issue)
+        if lock is None and path.exists():
+            return False  # present but not a readable lock: not provably ours to delete
+        if lock is not None and not lock.is_mine():
+            return False
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return not path.exists()
+
+    def is_mine(self) -> bool:
+        """True when THIS process wrote the lock: same pid, and the same boot_id/pid_start wherever both the
+        record and this host know them."""
+        if self.pid != os.getpid():
+            return False
+        return _same_identity(self.boot_id, current_boot_id()) and _same_identity(
+            self.pid_start, pid_start_time(os.getpid())
+        )
+
     def pid_alive(self) -> bool:
-        """os.kill(pid, 0) semantics; PermissionError counts as alive."""
+        """True when the process that WROTE the lock is still running: `os.kill(pid, 0)` succeeds
+        (PermissionError counts as alive — someone else's process, just not ours to signal) AND the live pid's
+        boot_id/pid_start still match the recorded ones. A pid that is alive but was started at another time,
+        or under another kernel boot, is a recycled pid: the writer is dead and its stage was interrupted."""
         if self.pid <= 0:
             return False
         try:
@@ -830,10 +949,49 @@ class RunLock:
         except ProcessLookupError:
             return False
         except PermissionError:
-            return True  # someone else's process: alive, just not ours to signal
+            pass  # someone else's process: alive, just not ours to signal
         except OSError:
             return False
-        return True
+        if not _same_identity(self.boot_id, current_boot_id()):
+            return False
+        return _same_identity(self.pid_start, pid_start_time(self.pid))
+
+
+def last_error_path(factory_dir: Path, issue: int) -> Path:
+    return Path(factory_dir) / "run" / f"{issue}.last-error"
+
+
+def write_last_error(factory_dir: Path, issue: int, message: str) -> None:
+    """Carry why THIS attempt failed into the next attempt's stage_note (prompts.py).
+
+    The RunLock cannot do it for an attempt that exits 1 cleanly: cli.py clears the lock in a finally at the
+    end of every command, so the lock's own `last_error` survives only a kill (see RunLock). This file
+    outlives the command; whoever gets past the failure clears it. A blank message clears it too — there is
+    nothing to tell the next attempt. FactoryError when the file cannot be written."""
+    text = str(message or "").strip()
+    if not text:
+        clear_last_error(factory_dir, issue)
+        return
+    atomic_write_text(last_error_path(factory_dir, issue), text + "\n")
+
+
+def read_last_error(factory_dir: Path, issue: int) -> str | None:
+    """The recorded message stripped, or None when the file is absent, unreadable or blank. Host-local
+    transient (design §7): losing it costs the next attempt its stage_note and nothing else."""
+    try:
+        text = last_error_path(factory_dir, issue).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return text.strip() or None
+
+
+def clear_last_error(factory_dir: Path, issue: int) -> None:
+    """Idempotent; FactoryError only when the file exists and cannot be removed."""
+    path = last_error_path(factory_dir, issue)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise FactoryError(f"could not clear {path}: {exc}") from exc
 
 
 def read_poll_journal(factory_dir: Path) -> dict:

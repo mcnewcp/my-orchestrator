@@ -293,19 +293,80 @@ def test_has_changes_can_be_scoped_to_paths(sandbox, wt):
     assert repo.has_changes(wt, ["src"]) is False
 
 
-def test_reset_hard_discards_edits_and_untracked_files_but_respects_excludes(sandbox, wt):
+def test_reset_hard_discards_edits_untracked_and_ignored_files_but_keeps_dot_factory(sandbox, wt):
+    """A rejected stage must leave nothing behind, including under an ignored path: `.venv/bin/pytest` or a
+    stale `__pycache__` would otherwise still be there when the next attempt runs the checks."""
     repo = sandbox.repo
     write(wt / "src" / "app.py", "print('broken')\n")
     write(wt / "junk" / "leftover.txt", "junk\n")
+    write(wt / ".venv" / "bin" / "pytest", "#!/bin/sh\nexit 0\n")
+    write(wt / "src" / "__pycache__" / "app.cpython-312.pyc", "stale\n")
     write(wt / ".factory" / "tmp" / "keep.diff", "kept\n")
 
     repo.reset_hard(wt)
 
     assert (wt / "src" / "app.py").read_text() == "print('hello')\n"
     assert not (wt / "junk").exists()
-    # excluded, so `git clean -fd` leaves it alone
+    assert not (wt / ".venv").exists(), "an ignored path is not a hiding place (git clean -fdx)"
+    assert not (wt / "src" / "__pycache__").exists()
+    # the worktree's own host-local directory survives: a gate failure is still reading the diff it wrote there
     assert (wt / ".factory" / "tmp" / "keep.diff").exists()
     assert repo.is_clean(wt)
+
+
+def test_stage_all_stages_every_change_without_committing(sandbox, wt):
+    repo = sandbox.repo
+    head = repo.head(wt)
+    write(wt / "src" / "app.py", "print('edited')\n")
+    write(wt / "new.txt", "new\n")
+    (wt / "README.md").unlink()
+    write(wt / ".venv" / "bin" / "pytest", "ignored\n")
+
+    repo.stage_all(wt)
+
+    staged = run_git(["diff", "--cached", "--name-only"], wt).split()
+    assert sorted(staged) == ["README.md", "new.txt", "src/app.py"]
+    assert repo.head(wt) == head, "stage_all never commits"
+
+
+def test_clean_ignored_removes_only_ignored_files(sandbox, wt):
+    repo = sandbox.repo
+    write(wt / ".venv" / "bin" / "pytest", "#!/bin/sh\nexit 0\n")
+    write(wt / "src" / "__pycache__" / "app.cpython-312.pyc", "stale\n")
+    write(wt / "src" / "app.py", "print('work in progress')\n")
+    write(wt / "new_module.py", "x = 1\n")
+    write(wt / ".factory" / "tmp" / "review-1.diff", "kept\n")
+
+    repo.clean_ignored(wt)
+
+    assert not (wt / ".venv").exists()
+    assert not (wt / "src" / "__pycache__").exists()
+    # the work under review is untouched: edits, new untracked files and .factory/ all survive
+    assert (wt / "src" / "app.py").read_text() == "print('work in progress')\n"
+    assert (wt / "new_module.py").exists()
+    assert (wt / ".factory" / "tmp" / "review-1.diff").exists()
+
+
+def test_clean_ignored_honours_the_keep_list(sandbox, wt):
+    repo = sandbox.repo
+    write(wt / ".venv" / "bin" / "pytest", "x\n")
+    write(wt / "node_modules" / "pkg" / "index.js", "x\n")
+    write(wt / ".factory" / "tmp" / "keep.diff", "kept\n")
+
+    repo.clean_ignored(wt, keep=(".factory/", "node_modules/"))
+
+    assert not (wt / ".venv").exists()
+    assert (wt / "node_modules" / "pkg" / "index.js").exists()
+    assert (wt / ".factory" / "tmp" / "keep.diff").exists()
+
+
+def test_clean_ignored_is_a_no_op_when_nothing_is_ignored(sandbox, wt):
+    repo = sandbox.repo
+    write(wt / "src" / "app.py", "print('edited')\n")
+
+    repo.clean_ignored(wt)
+
+    assert (wt / "src" / "app.py").read_text() == "print('edited')\n"
 
 
 def test_reset_hard_rewinds_to_a_ref(sandbox, wt):

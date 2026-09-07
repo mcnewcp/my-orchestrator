@@ -38,6 +38,9 @@ _EXCLUDE_HEADER = "# factory: transient paths (repo.ensure_excludes)"
 
 # `git worktree` names its worktrees by directory; these two components identify one of ours.
 _WORKTREES_MARKER = (".factory", "worktrees")
+# The worktree's own host-local directory: kept by every clean, because a stage writes the review diff and its
+# other scratch files there (design §9, deviation 11) and a gate failure must not delete what it is reporting on.
+FACTORY_DIR_ENTRY = ".factory/"
 
 
 def branch_name(issue: int) -> str:
@@ -315,9 +318,60 @@ class Repo:
         return bool(self._status_paths(wt, paths))
 
     def reset_hard(self, wt: Path, ref: str = "HEAD") -> None:
-        """`git reset --hard ref` + `git clean -fd` (untracked files and dirs, respecting .gitignore)."""
+        """`git reset --hard ref` + `git clean -fdx -e .factory/`: every untracked file and directory goes,
+        IGNORED ONES INCLUDED, except the worktree's own `.factory/` (host-local factory files — the review
+        diff a stage wrote there is still being read when a gate fails, design §9 / deviation 11).
+
+        `-x` is the point: a write stage runs with the repo's own ignores in force, so without it a session
+        could leave `.venv/bin/pytest`, `node_modules/.bin/…` or a `__pycache__` full of stale bytecode behind
+        after its stage was rejected, and the next attempt's checks would run against that. "The failed stage
+        left nothing" has to mean nothing. The cost is a rebuilt virtualenv or dependency tree on the next
+        stage, which is the right trade for a gate that cannot be undermined."""
         git(["reset", "--hard", ref], wt)
-        git(["clean", "-fd"], wt)
+        git(["clean", "-fdx", "-e", FACTORY_DIR_ENTRY], wt)
+
+    def stage_all(self, wt: Path) -> None:
+        """`git add -A` — stage every change in the worktree (including deletions and untracked files), without
+        committing. Ignored files are not staged, by git's own rule. commit_all does this itself; this is for a
+        caller that wants the index to describe the worktree before it inspects or commits it."""
+        git(["add", "-A"], wt)
+
+    def clean_ignored(self, wt: Path, keep: tuple[str, ...] = (".factory/",)) -> None:
+        """Remove the IGNORED untracked files and directories (`.venv/`, `node_modules/`, caches — everything
+        `git status` never shows), keeping every tracked file, every untracked file that IS a change, and
+        everything named in `keep`. Use it to drop a session's tooling droppings without touching the work
+        under review; reset_hard is what throws the work away as well.
+
+        `git clean -fdX -e .factory/` does NOT do this: under `-X` an `-e` pattern joins the ignore rules, so
+        it names something to REMOVE rather than something to spare (verified against git 2.53 — `-e` only
+        spares under `-x`, where the standard rules are off). Pathspec exclusion (`-- . ':!.factory'`) is
+        ignored for a collapsed ignored directory as well. So the ignored entries are listed first and the
+        kept ones filtered out in Python, and the survivors are removed by path with `-x` (the list is
+        already exactly the ignored set, so `-x` removes those and nothing else)."""
+        targets = self._ignored_entries(wt, keep)
+        if not targets:
+            return
+        git(["clean", "-fdx", "--", *targets], wt)
+
+    def _ignored_entries(self, wt: Path, keep: tuple[str, ...]) -> list[str]:
+        """`git ls-files --others --ignored --exclude-standard --directory` (a wholly ignored directory comes
+        back collapsed, with a trailing '/'), minus anything `keep` covers. A kept path INSIDE a collapsed
+        directory spares the whole directory: removing it would take the kept path with it."""
+        listed = _split_z(
+            git(
+                ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"],
+                wt,
+            ).stdout
+        )
+        kept = [entry.strip().strip("/") for entry in keep if entry.strip().strip("/")]
+        targets: list[str] = []
+        for entry in listed:
+            path = entry.rstrip("/")
+            inside_kept = any(path == k or path.startswith(k + "/") for k in kept)
+            holds_kept = any(k.startswith(path + "/") for k in kept)
+            if not inside_kept and not holds_kept:
+                targets.append(entry)
+        return targets
 
     def checkout_paths(self, wt: Path, ref: str, paths: list[str]) -> None:
         """`git checkout ref -- paths` (restore files from a commit); missing paths are ignored."""

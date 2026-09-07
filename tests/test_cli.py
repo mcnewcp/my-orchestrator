@@ -235,7 +235,16 @@ def test_running_outside_a_checkout_is_a_factory_error(tmp_path, monkeypatch, ca
     [
         ("spec", {"need_state": False}),
         ("run", {"need_state": False}),
-        ("abandon", {"need_state": False, "commit_operator_edits": False}),
+        (
+            "abandon",
+            {
+                "need_state": False,
+                "commit_operator_edits": False,
+                "fetch": False,
+                "strict_clean": False,
+                "check_protected": False,
+            },
+        ),
         ("plan", {}),
         ("review", {}),
         ("finalize", {}),
@@ -271,20 +280,53 @@ def test_dismiss_passes_the_finding_and_reason_through(checkout, prepared, monke
     assert seen == {"id": "F3", "reason": "duplicate of F1", "issue": 42}
 
 
-def test_the_run_lock_is_cleared_even_when_the_stage_fails(checkout, monkeypatch):
-    factory_dir = checkout / ".factory"
+def _prepare_taking_the_lock(monkeypatch, factory_dir: Path):
+    """Stand in for stages.prepare: take the lock the way it does (RunLock.create + ctx.holds_lock)."""
 
     def fake_prepare(ctx, **_kwargs):
-        RunLock(issue=42, stage="build", pid=1234, started_at="now", worktree="wt").write(
-            factory_dir
-        )
+        RunLock.create(42, "build", "wt").write(factory_dir)
+        ctx.holds_lock = True
         ctx.prepared = True
         return ctx
 
     monkeypatch.setattr(stages, "prepare", fake_prepare)
+
+
+def test_the_run_lock_is_cleared_even_when_the_stage_fails(checkout, monkeypatch):
+    factory_dir = checkout / ".factory"
+    _prepare_taking_the_lock(monkeypatch, factory_dir)
     monkeypatch.setattr(stages, "build", lambda ctx: (_ for _ in ()).throw(FactoryError("red")))
     assert cli.main(["build", "42"]) == 1
     assert not RunLock.path(factory_dir, 42).exists()
+
+
+def test_a_lock_this_process_does_not_own_is_never_cleared(checkout, prepared, monkeypatch):
+    """A second container may be mid-stage on the same issue: prepare refuses, and this command's finally
+    must not delete the lock that refusal was about (state.RunLock.clear_if_owned)."""
+    factory_dir = checkout / ".factory"
+    foreign = RunLock(issue=42, stage="build", pid=1, started_at="now", worktree="wt")
+    foreign.write(factory_dir)
+
+    def refusing_prepare(ctx, **_kwargs):
+        raise FactoryError("issue 42: build in progress (pid 1)")
+
+    monkeypatch.setattr(stages, "prepare", refusing_prepare)
+    assert cli.main(["build", "42"]) == 1
+    assert RunLock.read(factory_dir, 42).pid == 1  # untouched
+
+
+def test_an_interrupt_leaves_the_lock_so_the_next_command_discards_the_stage(
+    checkout, monkeypatch, capsys
+):
+    """Design §7/§15: the dead pid IS the interrupted-stage signal, so ^C must not tidy it away."""
+    factory_dir = checkout / ".factory"
+    _prepare_taking_the_lock(monkeypatch, factory_dir)
+    monkeypatch.setattr(stages, "build", lambda ctx: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+    assert cli.main(["build", "42"]) == 1
+
+    assert "the next command will discard the partial stage" in capsys.readouterr().err
+    assert RunLock.read(factory_dir, 42).stage == "build"
 
 
 def test_the_global_flags_override_factory_toml(checkout, prepared, monkeypatch):

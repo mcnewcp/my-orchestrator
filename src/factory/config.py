@@ -1,5 +1,8 @@
 """factory.toml (design §14). Read once, from the checkout the command runs in, never from the worktree.
 
+DEFAULT_TOML is the packaged `templates/factory.toml` verbatim — the file `factory init` installs — so the
+documented default and the installed default cannot drift apart. Every key below must appear there.
+
 Extensions beyond §14, all with defaults so a §14-only file is valid (recorded in docs/design/deviations.md):
   [factory] max_nits            nit cap enforced as the review gate (§9 "nits ≤ cap"); default 10
   [factory] max_diff_bytes      review diff larger than this is truncated (stat + largest files first + banner)
@@ -66,37 +69,27 @@ class Config:
         return self.harness_config(self.harness).model or None
 
 
-DEFAULT_TOML = """\
-[factory]
-harness = "claude"                 # claude | codex
-auth = "api"                       # api | subscription (attended only; poll refuses it)
-base_branch = "main"
-max_fix_rounds = 3
-stage_timeout_min = 45
-checks = [["make", "test"], ["make", "lint"]]   # argv arrays, run without a shell
-test_paths = ["tests/"]
-protected_paths = []               # added to the built-in list (design §9)
-max_nits = 10                      # review gate: at most this many new nits per round
-max_diff_bytes = 300000            # review diff above this is truncated (stat + largest files first)
-transient_paths = []               # extra tooling droppings the worktree-clean rule ignores
-env_passthrough = []               # extra env var NAMES forwarded to harness + check subprocesses
+TEMPLATE_PATH = Path(__file__).parent / "templates" / "factory.toml"
 
-[poll]
-label = "factory"                  # the one label read from GitHub
-max_consecutive_failures = 3
 
-[harness.claude]
-model = ""                         # empty = CLI default
-pinned_version = ""                # doctor warns on mismatch; actual version recorded in state.json
-max_turns_read = 30                # the turn cap binds before the stage timeout; raise after watching num_turns
-max_turns_write = 120
-max_budget_usd = 0.0               # 0 = no cap
+def _default_toml() -> str:
+    """The packaged templates/factory.toml — the ONE copy of the default config.
 
-[harness.codex]
-model = ""
-pinned_version = ""
-writable_dirs = []                 # extra --add-dir roots for workspace-write, e.g. ["~/.cache/uv"]
-"""
+    `factory init` installs that file and DEFAULT_TOML documents it, so the two must be the same bytes: a
+    second copy here is how a repo ends up initialised without the keys the factory has since grown (a live
+    run reached codex with no `writable_dirs` line in the installed file, and therefore no --add-dir, because
+    the template lagged behind this constant). Read once, at import: the file ships inside the package, so an
+    unreadable one means a broken install and every command is about to fail anyway."""
+    try:
+        return TEMPLATE_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise FactoryError(
+            f"the packaged default config is missing or unreadable at {TEMPLATE_PATH}: {exc}",
+            hint="reinstall the factory package; templates/factory.toml ships inside it",
+        ) from exc
+
+
+DEFAULT_TOML = _default_toml()
 
 _TYPE_NAMES = {
     bool: "boolean",

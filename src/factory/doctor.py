@@ -10,10 +10,15 @@ command (config.checks[0]) must run in that worktree via checks.run_checks with 
 cannot write its cache, or a missing `make`).
 
 The scratch worktree holds no repository source, so the check command is smoke-tested rather than run for real: when
-config.checks[0] invokes `make`, doctor seeds a Makefile whose targets are no-ops (_seed_probe_check). What the step
-proves is that the command executes inside a fresh worktree under the harness's sandbox leftovers, which is what
-design §13 asks of it. The scratch repo also carries an AGENTS.md stand-in, so an api-mode probe exercises
---append-system-prompt-file exactly as an api-mode stage does.
+config.checks[0] invokes `make`, doctor seeds a Makefile whose targets are no-ops (_seed_probe_check), and the report
+line says so. What the step proves is that the command executes inside a fresh worktree under the harness's sandbox
+leftovers, which is what design §13 asks of it — never that the repository's checks pass. The scratch repo also
+carries an AGENTS.md stand-in, so an api-mode probe exercises --append-system-prompt-file exactly as an api-mode
+stage does.
+
+Every probe goes through harness.get_harness(...).run(...) — the same adapter, and therefore the same argv builder
+(ClaudeCode.argv / Codex.argv), that every stage uses. That is the point of `doctor`: a flag that disappeared from a
+CLI must fail here, on a two-turn errand, rather than 40 minutes into a build.
 
 .factory/doctor.json = {"<harness>:<auth>": {"factory_version", "cli_version", "at", "checks": [...]}}; records for
 different combinations coexist. cli.py runs doctor once for the configured (harness, auth) pair, or for the pair given by
@@ -380,12 +385,19 @@ def _probe_worktree(report: DoctorReport, repo: Repo, config: Config, harness: s
     return worktree
 
 
+def _seeds_a_makefile(config: Config) -> bool:
+    """True when the probed check is a `make` invocation, and therefore runs against targets doctor wrote
+    rather than the repository's own. The report says so; nothing else depends on it."""
+    first = config.checks[0] if config.checks else []
+    return bool(first) and Path(first[0]).name == "make"
+
+
 def _seed_probe_check(worktree: Path, config: Config) -> None:
     """`make test` in a scratch worktree fails for want of a Makefile, which says nothing about the toolchain, so a
     `make` check gets no-op targets to run against. Any other command is run exactly as configured."""
-    first = config.checks[0] if config.checks else []
-    if not first or Path(first[0]).name != "make":
+    if not _seeds_a_makefile(config):
         return
+    first = config.checks[0]
     targets = [arg for arg in first[1:] if not arg.startswith("-")] or ["all"]
     recipes = "".join(f"{target}:\n\t@true\n" for target in targets)
     (worktree / "Makefile").write_text(f".PHONY: {' '.join(targets)}\n{recipes}", encoding="utf-8")
@@ -474,8 +486,23 @@ def _probe_check(report: DoctorReport, probe: _Probe) -> bool:
     if not run.ok:
         report._fail(f"write probe: check `{name}` failed in the probe worktree: {_tail(run.log)}")
         return False
-    report._ok(f"write probe: check `{name}` ran in the probe worktree")
+    report._ok(f"write probe: check `{name}` {_probe_check_scope(probe.config)}")
     return True
+
+
+def _probe_check_scope(config: Config) -> str:
+    """What passing the probe check does and does not prove. The probe worktree holds no repository source: a
+    `make` check runs against the no-op targets doctor seeded, so a green line here says the sandbox can find
+    and execute `make` after the harness has written in that worktree — never that the repository's checks pass."""
+    if _seeds_a_makefile(config):
+        return (
+            "ran against a seeded no-op Makefile — proves the sandbox can exec make, "
+            "not the repo's checks"
+        )
+    return (
+        "ran in the probe worktree, which holds no repository source — proves the command executes, "
+        "not that the repo's checks pass"
+    )
 
 
 # ---------------------------------------------------------------- record

@@ -7,9 +7,11 @@ stub script written into tmp_path. No conftest fixtures, no fakes, no network, n
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 
@@ -426,6 +428,56 @@ def test_run_streaming_timeout_kills_the_process_group_and_keeps_the_transcript(
     assert "partial-transcript" in stdout_path.read_text()
     assert _pid_gone(int(child_pid_file.read_text().strip())), (
         "the grandchild outlived the killed group"
+    )
+
+
+def test_run_streaming_kills_the_process_group_when_the_wait_is_interrupted(tmp_path, monkeypatch):
+    """Ctrl-C (or any other exception out of wait) must not orphan the session: the child leads its own
+    process group, so nothing else would ever reap it or the `make`/`pytest` grandchildren it spawned."""
+    child_pid_file = tmp_path / "child.pid"
+    script = tmp_path / "sleeper.sh"
+    script.write_text(
+        "#!/bin/bash\n"
+        "echo partial-transcript\n"
+        "sleep 300 &\n"
+        f'echo $! > "{child_pid_file}"\n'
+        "sleep 300\n"
+    )
+    script.chmod(0o755)
+    stdout_path = tmp_path / "transcripts" / "42" / "build-1.json"
+
+    class InterruptedPopen(subprocess.Popen):
+        """A real child, but the first wait() — run_streaming's own — raises the way Ctrl-C does. The waits
+        inside the kill helper must still work, so only the first call is interrupted."""
+
+        interrupted = False
+
+        def wait(self, timeout=None):
+            if not InterruptedPopen.interrupted:
+                InterruptedPopen.interrupted = True
+                # wait a moment first, as a real Ctrl-C would arrive mid-session with output on disk
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    super().wait(timeout=1)
+                raise KeyboardInterrupt
+            return super().wait(timeout=timeout)
+
+    monkeypatch.setattr(harness.subprocess, "Popen", InterruptedPopen)
+
+    with pytest.raises(KeyboardInterrupt):
+        harness.run_streaming(
+            [str(script)],
+            cwd=tmp_path,
+            env={"PATH": os.environ["PATH"]},
+            timeout_s=300,
+            stdout_path=stdout_path,
+            stderr_path=Path(str(stdout_path) + ".stderr"),
+            what="claude",
+        )
+
+    assert InterruptedPopen.interrupted
+    assert "partial-transcript" in stdout_path.read_text(), "the transcript survives an interrupt"
+    assert _pid_gone(int(child_pid_file.read_text().strip())), (
+        "the grandchild outlived an interrupted wait"
     )
 
 

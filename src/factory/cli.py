@@ -8,10 +8,14 @@ Commands: init doctor spec accept plan build review fix finalize run poll status
 
 Dispatch: discover Repo from cwd; init needs no config (it writes it); everything else load_config + validate_overrides.
 Issue commands build one Context, call stages.prepare(ctx, ...) once with the per-command policy (spec/run
-need_state=False; abandon commit_operator_edits=False; status does not prepare), dispatch, and clear the RunLock in a
-finally. `run` uses stages.run_issue semantics inline; `poll` passes a closure over stages.run_issue.
+need_state=False; abandon prepares for a teardown — no fetch, no operator-edit commit, no dirty-worktree refusal and
+no protected-path check, because it deletes the branch either way; status does not prepare), dispatch, and release the
+RunLock in a finally. `run` uses stages.run_issue semantics inline; `poll` passes a closure over stages.run_issue.
 NeedsHuman prints "needs human: <gate>\n<what clears it>" to stderr and returns 2.
 FactoryError prints "error: <message>" (+ hint, + "transcript: <path>" for HarnessError) and returns 1.
+KeyboardInterrupt prints "error: interrupted; the next command will discard the partial stage" and returns 1 — the
+lock is deliberately LEFT behind, so the next command sees a dead writer and takes the interrupted-stage path
+(design §7, §15) instead of resuming on top of half-written work.
 Progress lines go to stderr; only `status` and `version` write to stdout.
 
 A usage error (unknown command, bad flag, missing argument, no command at all) is a FactoryError too: argparse's own
@@ -56,10 +60,19 @@ _ISSUE_COMMANDS = {
 }
 
 #: Per-command prepare() policy (design deviation 9). Everything else uses prepare()'s defaults.
+#: `abandon` removes the label, the PR, the branch and the worktree; every start-of-command rule that could
+#: refuse — a fetch that finds the remote diverged, a dirty worktree, a protected path changed on the branch —
+#: would only strand the very state it exists to clean up, so abandon is exempt from all of them.
 _PREPARE_POLICY = {
     "spec": {"need_state": False},
     "run": {"need_state": False},
-    "abandon": {"need_state": False, "commit_operator_edits": False},
+    "abandon": {
+        "need_state": False,
+        "commit_operator_edits": False,
+        "fetch": False,
+        "strict_clean": False,
+        "check_protected": False,
+    },
 }
 
 _ISSUE_HELP = "GitHub issue number"
@@ -150,7 +163,9 @@ def main(argv: list[str] | None = None) -> int:
         _report(exc)
         return exc.exit_code
     except KeyboardInterrupt:
-        print("error: interrupted", file=sys.stderr)
+        print(
+            "error: interrupted; the next command will discard the partial stage", file=sys.stderr
+        )
         return 1
     except Exception:
         traceback.print_exc(file=sys.stderr)
@@ -254,14 +269,21 @@ def _issue_command(
     if command == "status":  # local state only: no prepare, no fetch, no gh, no lock
         print(stages.status(ctx))
         return 0
+    interrupted = False
     try:
         stages.prepare(ctx, **_PREPARE_POLICY.get(command, {}))
         if command == "dismiss":
             stages.dismiss(ctx, args.finding, args.reason)
         else:
             getattr(stages, command)(ctx)
+    except KeyboardInterrupt:
+        interrupted = True  # leave the lock: its dead pid is how the next command knows to reset
+        raise
     finally:
-        RunLock.clear(repo.factory_dir, args.issue)
+        # Only the lock this process took, and only if it is still ours: another container may be holding one
+        # for the same issue, and clearing it would hand it two writers (state.RunLock.clear_if_owned).
+        if ctx.holds_lock and not interrupted:
+            RunLock.clear_if_owned(repo.factory_dir, args.issue)
     return 0
 
 

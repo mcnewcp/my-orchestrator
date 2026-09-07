@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
+
 import pytest
 
+from factory import prompts
 from factory.config import (
     AUTHS,
     DEFAULT_TOML,
     HARNESSES,
+    TEMPLATE_PATH,
     Config,
     HarnessConfig,
     load_config,
@@ -63,6 +67,61 @@ def test_section_14_file_is_valid_and_matches_the_defaults():
 def test_default_toml_template_parses_and_round_trips():
     config = parse_config(DEFAULT_TOML)
     assert config == Config()
+    assert config.harnesses["claude"] == HarnessConfig()
+    assert config.harnesses["codex"] == HarnessConfig()
+
+
+def test_default_toml_is_the_file_factory_init_installs():
+    """One copy of the default config, not two: `factory init` writes templates/factory.toml, and a template
+    that lagged behind this constant is how a live run reached codex with no writable_dirs key (and therefore
+    no --add-dir) in the installed file."""
+    assert DEFAULT_TOML == prompts.load_template("factory.toml")
+    assert DEFAULT_TOML == TEMPLATE_PATH.read_text(encoding="utf-8")
+    assert TEMPLATE_PATH.name == "factory.toml"
+
+
+# Every Config field, and the TOML key that carries it. A field added without a line in the template — the
+# file `factory init` installs — is a key an initialised repo silently cannot set.
+CONFIG_KEYS = {
+    "harness": "harness",
+    "auth": "auth",
+    "base_branch": "base_branch",
+    "max_fix_rounds": "max_fix_rounds",
+    "stage_timeout_min": "stage_timeout_min",
+    "checks": "checks",
+    "test_paths": "test_paths",
+    "protected_paths": "protected_paths",
+    "max_nits": "max_nits",
+    "max_diff_bytes": "max_diff_bytes",
+    "transient_paths": "transient_paths",
+    "env_passthrough": "env_passthrough",
+    "poll_label": "label",  # [poll] label
+    "poll_max_consecutive_failures": "max_consecutive_failures",  # [poll]
+    "harnesses": "[harness.claude]",  # the per-harness tables
+}
+
+
+def test_default_toml_documents_every_config_field():
+    assert {field.name for field in fields(Config)} == set(CONFIG_KEYS), (
+        "a new Config field needs a line in templates/factory.toml and an entry here"
+    )
+    lines = DEFAULT_TOML.splitlines()
+    for name, key in CONFIG_KEYS.items():
+        if key.startswith("["):
+            assert key in lines, f"{name} is not documented in the default factory.toml"
+        else:
+            assert any(line.startswith(f"{key} = ") for line in lines), (
+                f"{name} is not documented in the default factory.toml as `{key} = ...`"
+            )
+
+
+def test_default_toml_documents_every_harness_field():
+    lines = DEFAULT_TOML.splitlines()
+    assert "[harness.claude]" in lines and "[harness.codex]" in lines
+    for field_ in fields(HarnessConfig):
+        assert any(line.startswith(f"{field_.name} = ") for line in lines), (
+            f"[harness.*] {field_.name} is not documented in the default factory.toml"
+        )
 
 
 def test_every_documented_key_is_read():

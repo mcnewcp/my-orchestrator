@@ -300,6 +300,9 @@ def test_latest_check_log_ignores_unparseable_names_when_a_real_log_exists(tmp_p
     "path",
     [
         "Makefile",
+        "GNUmakefile",
+        "makefile",
+        "MAKEFILE",
         "factory.toml",
         "AGENTS.md",
         "CLAUDE.md",
@@ -308,10 +311,16 @@ def test_latest_check_log_ignores_unparseable_names_when_a_real_log_exists(tmp_p
         ".github",
         ".github/workflows/ci.yml",
         ".claude/settings.json",
+        ".CLAUDE/settings.json",
         ".claude",
         ".devcontainer/Dockerfile",
         ".codex/config.toml",
         "./Makefile",
+        # both CLIs load the instruction file of every directory they read, so a nested one configures
+        # the next session exactly as the root one does
+        "docs/AGENTS.md",
+        "src/deep/nest/CLAUDE.md",
+        "docs/agents.md",
     ],
 )
 def test_is_protected_true(path):
@@ -323,10 +332,12 @@ def test_is_protected_true(path):
     [
         "src/app.py",
         "Makefile.in",
+        "GNUmakefile.in",
         ".githubbing/x",
         "sub/.github/x.yml",
-        "sub/Makefile",
-        "docs/AGENTS.md",
+        "sub/Makefile",  # only the root Makefile is the one `make` runs for the checks
+        "docs/AGENTS.md.bak",
+        "docs/notes/AGENTS.mdx",
         "",
         "work/42/plan.md",
     ],
@@ -342,6 +353,16 @@ def test_is_protected_includes_config_entries():
     assert checks.is_protected("deploy", config) is True
     assert checks.is_protected("SECURITY.md", config) is True
     assert checks.is_protected("SECURITY.md.bak", config) is False
+    # config entries are matched case-insensitively too
+    assert checks.is_protected("Deploy/Dockerfile", config) is True
+    assert checks.is_protected("security.md", config) is True
+
+
+def test_every_name_gnu_make_looks_for_is_protected():
+    """GNU make reads GNUmakefile, then makefile, then Makefile: renaming the gate is changing the gate."""
+    assert set(checks.PROTECTED_PATHS) >= {"GNUmakefile", "makefile", "Makefile"}
+    for name in ("GNUmakefile", "makefile", "Makefile"):
+        assert checks.is_protected(name, Config()) is True
 
 
 @pytest.mark.parametrize(
@@ -504,6 +525,44 @@ def test_a_protected_path_is_a_violation_for_every_write_stage():
         ) == [".claude/hooks/pre.sh"]
 
 
+def test_a_transient_location_cannot_launder_a_protected_path():
+    """The rules are evaluated over the path itself: is_transient() says which droppings the clean/dirty
+    comparison ignores (deviation 12), not which edits a write stage is allowed to make."""
+    config = Config(transient_paths=["vendor/"])
+    changed = ["vendor/pkg/AGENTS.md", "vendor/pkg/index.js"]
+
+    for stage in ("build", "fix"):
+        assert checks.allowed_edit_violations(changed, stage=stage, issue=42, config=config) == [
+            "vendor/pkg/AGENTS.md"
+        ]
+
+
+def test_a_transient_location_cannot_launder_a_test_path_or_a_work_path():
+    config = Config(test_paths=["target/tests/"], transient_paths=["target/"])
+    changed = ["target/tests/test_app.py", "target/debug/app", "work/42/state.json"]
+
+    assert checks.allowed_edit_violations(changed, stage="fix", issue=42, config=config) == [
+        "target/tests/test_app.py",
+        "work/42/state.json",
+    ]
+    # build may write anything outside work/ — including a transient location
+    assert checks.allowed_edit_violations(changed, stage="build", issue=42, config=config) == [
+        "work/42/state.json"
+    ]
+
+
+def test_the_ignore_list_still_wins_over_every_rule():
+    """`ignore` is the factory's own rendered prompt, which it wrote into work/<issue>/prompts/ itself."""
+    changed = ["work/42/prompts/fix-2.md"]
+
+    assert (
+        checks.allowed_edit_violations(
+            changed, stage="fix", issue=42, config=Config(), ignore=["./work/42/prompts/fix-2.md"]
+        )
+        == []
+    )
+
+
 # ---------------------------------------------------------------- plan gates
 
 
@@ -551,6 +610,55 @@ def test_paths_missing_from_plan_needs_the_exact_path():
         checks.paths_missing_from_plan(["src/app.py"], "- (`src/app.py`), rewritten.", issue=42)
         == []
     )
+
+
+def test_paths_missing_from_plan_matches_paths_containing_spaces():
+    """The gate searches for the path literally, so nothing about how a path is spelled hides it: a token
+    scan split `src/my report.py` at the space and failed every build that touched it."""
+    plan = "## Files that change\n\n- `src/my report.py` — rewritten\n- 'docs/read me.md'\n"
+
+    assert checks.paths_missing_from_plan(["src/my report.py"], plan, issue=42) == []
+    assert checks.paths_missing_from_plan(["docs/read me.md"], plan, issue=42) == []
+    # still bounded: a longer name that merely contains the listed one is a different file
+    assert checks.paths_missing_from_plan(["src/my report.py.bak"], plan, issue=42) == [
+        "src/my report.py.bak"
+    ]
+    assert checks.paths_missing_from_plan(["src/my report.p"], plan, issue=42) == [
+        "src/my report.p"
+    ]
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        "- `src/app.py`\n",
+        "- (src/app.py)\n",
+        '- "src/app.py"\n',
+        "- [src/app.py](x)\n",
+        "- src/app.py, and nothing else\n",
+        "- we rewrite src/app.py.\n",  # a sentence stop is not part of the path
+        "src/app.py",  # end of text
+        "- `./src/app.py`\n",  # a plan may spell it relative to the root
+        "- `src\\app.py`\n",  # or the windows way
+    ],
+)
+def test_a_listed_path_is_recognised_through_its_markdown(plan):
+    assert checks.paths_missing_from_plan(["src/app.py"], plan, issue=42) == []
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        "- `src/app.py.bak`\n",
+        "- `docs/src/app.py`\n",
+        "- `src/app.pyc`\n",
+        "- `xsrc/app.py`\n",
+        "- `src/app.py-old`\n",
+        "",
+    ],
+)
+def test_a_path_that_merely_contains_the_changed_one_does_not_list_it(plan):
+    assert checks.paths_missing_from_plan(["src/app.py"], plan, issue=42) == ["src/app.py"]
 
 
 def test_paths_missing_from_plan_deduplicates_and_skips_work():

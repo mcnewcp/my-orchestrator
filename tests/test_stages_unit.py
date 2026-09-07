@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from factory import stages
+from factory import state as state_module
 from factory.config import Config
 from factory.errors import FactoryError, GateViolation, NeedsHuman
 from factory.gh import PullRequest
@@ -74,9 +75,10 @@ class StubHarness:
 
     name = "stub"
 
-    def __init__(self, output: dict, *, writes: dict[str, str] | None = None):
+    def __init__(self, output: dict, *, writes: dict[str, str] | None = None, num_turns: int = 3):
         self.output = output
         self.writes = writes or {}
+        self.num_turns = num_turns
         self.calls: list[dict] = []
 
     def run(self, **kwargs) -> HarnessResult:
@@ -94,7 +96,7 @@ class StubHarness:
             cli_version="9.9.9",
             model="stub-model-1",
             duration_s=0.5,
-            num_turns=3,
+            num_turns=self.num_turns,
         )
 
     def version(self, env):
@@ -230,6 +232,27 @@ def spec_and_plan(ctx: Context) -> State:
     )
     ctx.ledger.save(ctx.worktree, ISSUE)
     ctx.repo.commit_all(ctx.worktree, "factory(42): plan")
+    ctx.state = State.load(ctx.worktree, ISSUE)
+    return ctx.state
+
+
+def ready_for_review(ctx: Context) -> State:
+    """spec, plan and build recorded and committed, no outcome and no review yet: what `review` expects."""
+    state = base_state(ctx)
+    work_file(ctx, "intent.md", "# Intent: add greet\n")
+    work_file(ctx, "spec.md", "## Problem\nno greet\n")
+    work_file(ctx, "plan.md", "## Files that change\n\n- src/app.py\n\n## Proof\n\nmake test\n")
+    for name in stages.STAGE_ORDER:
+        state.stages[name] = StageRecord(
+            start_commit=state.base["sha"],
+            at="2026-09-06T00:00:00Z",
+            harness="claude",
+            model="m",
+            cli_version="9.9.9",
+            auth="subscription",
+        )
+    state.save(ctx.worktree)
+    ctx.repo.commit_all(ctx.worktree, "factory(42): build")
     ctx.state = State.load(ctx.worktree, ISSUE)
     return ctx.state
 
@@ -604,9 +627,8 @@ def prepared_for_harness(ctx: Context, harness: StubHarness) -> None:
     ctx.state = base_state(ctx)
     ctx.harness = harness
     ctx.harness_env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"]}
-    RunLock(
-        issue=ISSUE, stage="", pid=os.getpid(), started_at="now", worktree=str(ctx.worktree)
-    ).write(ctx.repo.factory_dir)
+    RunLock.create(ISSUE, "", ctx.worktree).write(ctx.repo.factory_dir)
+    ctx.holds_lock = True
 
 
 def test_run_harness_stage_writes_the_prompt_and_returns_the_validated_output(workspace):
@@ -744,6 +766,9 @@ def test_prepare_refuses_to_run_beside_a_live_stage(workspace):
     with pytest.raises(FactoryError, match="build in progress"):
         stages.prepare(fresh, need_state=True, fetch=False)
 
+    assert fresh.holds_lock is False  # so cli.py's finally leaves the other writer's lock alone
+    assert RunLock.read(fresh.repo.factory_dir, ISSUE).pid == 1
+
 
 def test_prepare_discards_an_interrupted_stage_and_carries_its_last_error(workspace):
     ctx = make_context(workspace)
@@ -869,3 +894,301 @@ def test_ensure_pr_is_not_fatal_when_gh_fails(workspace):
     assert any("could not reach the pull request" in line for line in lines)
     with pytest.raises(FactoryError, match="gh is not on PATH"):
         stages.ensure_pr(ctx, required=True)
+
+
+# ---------------------------------------------------------------- the lock and the last-error channel
+
+
+def test_prepare_takes_a_lock_this_process_owns(workspace):
+    ctx = make_context(workspace)
+    ctx.state = base_state(ctx)
+    stages.commit_and_push(ctx, "factory(42): spec")
+    fresh = make_context(workspace)
+    fresh.prepared = False
+
+    stages.prepare(fresh, need_state=True, fetch=False)
+
+    lock = RunLock.read(fresh.repo.factory_dir, ISSUE)
+    assert fresh.holds_lock is True
+    assert lock.pid == os.getpid() and lock.is_mine()
+
+
+def test_prepare_carries_a_previous_exit_1_into_the_stage_note(workspace):
+    """The lock cannot carry an ordinary exit 1 (cli.py clears it at the end of every command), so the
+    message travels in .factory/run/<issue>.last-error until an attempt reads it."""
+    ctx = make_context(workspace)
+    ctx.state = base_state(ctx)
+    stages.commit_and_push(ctx, "factory(42): spec")
+    message = "checks failed after build: python3 checks.py"
+    state_module.write_last_error(ctx.repo.factory_dir, ISSUE, message)
+    fresh = make_context(workspace)
+    fresh.prepared = False
+
+    stages.prepare(fresh, need_state=True, fetch=False)
+
+    assert fresh.last_error == message
+    assert message in stages._stage_note(fresh, notes=[])
+    # The file is consumed, but the lock now carries it: a kill here still reaches the next attempt.
+    assert state_module.read_last_error(fresh.repo.factory_dir, ISSUE) is None
+    assert RunLock.read(fresh.repo.factory_dir, ISSUE).last_error == message
+
+
+def test_an_interrupted_stage_outranks_an_older_recorded_exit_1(workspace):
+    ctx = make_context(workspace)
+    ctx.state = base_state(ctx)
+    stages.commit_and_push(ctx, "factory(42): spec")
+    state_module.write_last_error(ctx.repo.factory_dir, ISSUE, "an older exit 1")
+    dead = subprocess.Popen(["true"])  # reaped below, so its pid answers "no such process"
+    dead.wait()
+    RunLock(
+        issue=ISSUE,
+        stage="build",
+        pid=dead.pid,
+        started_at="now",
+        worktree=str(ctx.worktree),
+        last_error="killed mid-build",
+    ).write(ctx.repo.factory_dir)
+    fresh = make_context(workspace)
+    fresh.prepared = False
+
+    stages.prepare(fresh, need_state=True, fetch=False)
+
+    assert fresh.last_error == "killed mid-build"  # the more recent failure wins
+
+
+def test_commit_and_push_retires_the_previous_failure(workspace):
+    ctx = make_context(workspace)
+    ctx.state = base_state(ctx)
+    ctx.last_error = "checks failed after build: python3 checks.py"
+    state_module.write_last_error(ctx.repo.factory_dir, ISSUE, ctx.last_error)
+
+    stages.commit_and_push(ctx, "factory(42): spec")
+
+    assert state_module.read_last_error(ctx.repo.factory_dir, ISSUE) is None
+    assert ctx.last_error is None  # and the stages that follow in this command say nothing about it
+
+
+# ---------------------------------------------------------------- failures after the session
+
+
+def test_a_factory_error_after_the_session_resets_and_records_why(workspace):
+    """Design §15: not only the gates. A ledger merge that rejects the reviewer's output, an unwritable
+    artifact or a failed push must leave the worktree as clean as a gate does."""
+    ctx = make_context(workspace)
+    ctx.state = base_state(ctx)
+    stages.commit_and_push(ctx, "factory(42): spec")
+    (ctx.worktree / "src" / "app.py").write_text("half-written by the session\n", encoding="utf-8")
+
+    with pytest.raises(GateViolation) as exc:
+        with stages._after_the_session(ctx):
+            raise FactoryError("the ledger merge rejected the round", "look at review-2.json")
+
+    assert exc.value.message == "the ledger merge rejected the round"
+    assert exc.value.hint == "look at review-2.json"
+    assert ctx.repo.is_clean(ctx.worktree)
+    assert "half-written" not in (ctx.worktree / "src" / "app.py").read_text(encoding="utf-8")
+    assert state_module.read_last_error(ctx.repo.factory_dir, ISSUE) == exc.value.message
+
+
+def test_a_gate_violation_after_the_session_is_not_reset_twice(workspace):
+    ctx = make_context(workspace)
+    ctx.state = base_state(ctx)
+    already_handled = GateViolation("build changed paths it may not touch: Makefile", ["Makefile"])
+
+    class NoReset:
+        factory_dir = ctx.repo.factory_dir
+
+        def reset_hard(self, *args, **kwargs):
+            raise AssertionError("_gate_failure has already reset the worktree")
+
+    ctx.repo = NoReset()
+    with pytest.raises(GateViolation) as exc:
+        with stages._after_the_session(ctx):
+            raise already_handled
+
+    assert exc.value is already_handled
+
+
+def test_a_review_the_ledger_merge_rejects_resets_and_keeps_the_ledger(workspace):
+    ctx = make_context(workspace)
+    ready_for_review(ctx)
+    harness = StubHarness(
+        {
+            "summary": "one finding",
+            "updates": [],
+            "new": [
+                {
+                    "severity": "important",
+                    "pass": "bugs",
+                    "file": "src/app.py",
+                    "line": 1,
+                    "title": "   ",  # schema-valid, ledger-invalid: a finding with no title
+                    "detail": "d",
+                    "evidence": "e",
+                }
+            ],
+        }
+    )
+    ctx.harness = harness
+    ctx.harness_env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"]}
+    RunLock.create(ISSUE, "", ctx.worktree).write(ctx.repo.factory_dir)
+
+    with pytest.raises(FactoryError, match="is missing 'title'"):
+        stages.review(ctx)
+
+    assert ctx.repo.is_clean(ctx.worktree)
+    assert ctx.state.reviews == []
+    assert not (ctx.worktree / "work" / str(ISSUE) / "review-1.json").exists()
+    assert "missing 'title'" in state_module.read_last_error(ctx.repo.factory_dir, ISSUE)
+    assert (
+        ctx.worktree / ".factory" / "tmp" / "review-1.diff"
+    ).exists()  # .factory/ survives a reset
+
+
+# ---------------------------------------------------------------- the checks run on a pristine tree
+
+
+def test_the_checks_run_with_the_ignored_droppings_removed(workspace):
+    """A write stage's `Bash(uv *)`/`Bash(make *)` can leave (or edit) files git never reports. The checks
+    must not run against them; `.factory/` and the stage's own work stay."""
+    probe = "import os, sys; sys.exit(1 if os.path.exists('.venv/bin/pytest') else 0)"
+    ctx = make_context(workspace)
+    ctx.config.checks = [["python3", "-c", probe]]
+    ctx.harness_env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"]}
+    ctx.state = base_state(ctx)
+    tampered = ctx.worktree / ".venv" / "bin" / "pytest"
+    tampered.parent.mkdir(parents=True)
+    tampered.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    keep = ctx.worktree / ".factory" / "tmp" / "review-1.diff"
+    keep.parent.mkdir(parents=True)
+    keep.write_text("diff --git a/src/app.py b/src/app.py\n", encoding="utf-8")
+    (ctx.worktree / "src" / "new.py").write_text("x = 1\n", encoding="utf-8")
+
+    verdict = stages._run_checks(ctx)
+
+    assert verdict.ok, verdict.log
+    assert not tampered.exists()  # the toolchain rebuilds it; the gate cannot be undermined
+    assert keep.exists()  # the review diff is still being read when a gate fails (deviation 11)
+    assert (ctx.worktree / "src" / "new.py").exists()  # only IGNORED files go
+    assert "src/new.py" in ctx.repo.changed_paths_in_worktree(ctx.worktree)
+
+
+# ---------------------------------------------------------------- spec's base sha
+
+
+def test_spec_reads_origin_only_when_it_is_about_to_create_the_branch(workspace):
+    ctx = make_context(workspace)
+    ctx.worktree = None
+    ctx.state = None
+
+    assert stages._spec_base_sha(ctx, rewound=False) == ctx.repo.base_sha("main")
+
+
+def test_spec_on_an_existing_branch_bases_on_what_that_branch_was_cut_from(workspace):
+    """An interrupted first `spec` leaves a branch with no state.json. Reading origin/main again would
+    anchor the run on a commit the branch never contained, and every later diff would be wrong."""
+    ctx = make_context(workspace)
+    tip = ctx.repo.head(ctx.worktree)
+    git("commit", "--quiet", "--allow-empty", "-m", "someone else's commit on main", cwd=workspace)
+    git("push", "--quiet", "origin", "main", cwd=workspace)
+    ctx.repo.fetch()
+    assert ctx.repo.base_sha("main") != tip
+    ctx.state = None
+
+    assert stages._spec_base_sha(ctx, rewound=False) == tip
+
+
+# ---------------------------------------------------------------- the progress line
+
+
+@pytest.mark.parametrize(("num_turns", "reported"), [(3, True), (0, False)])
+def test_the_progress_line_reports_turns_only_when_the_harness_counted_them(
+    workspace, num_turns, reported
+):
+    """Codex reports no turn count; "0 turns" would be a fact the transcript contradicts."""
+    ctx = make_context(workspace)
+    lines: list[str] = []
+    ctx.out = lines.append
+    prepared_for_harness(
+        ctx, StubHarness({"markdown": "# Spec", "open_questions": []}, num_turns=num_turns)
+    )
+
+    stages.run_harness_stage(
+        ctx, stage="spec", round=1, mode="read", prompt_text="p", schema_name="spec"
+    )
+
+    line = next(line for line in lines if "finished in" in line)
+    assert ("3 turns, transcript" in line) is reported
+    assert ("turns" in line) is reported
+    assert "transcript" in line
+
+
+# ---------------------------------------------------------------- prepare's other start-of-command rules
+
+
+def test_prepare_refuses_when_a_protected_path_changed_on_the_branch(workspace):
+    """Design §19 / deviation 13: build's baseline checks and finalize's checks run whatever the Makefile
+    says, so the whole-branch check belongs at the start of every command, not only before a session."""
+    ctx = make_context(workspace)
+    ctx.state = base_state(ctx)
+    stages.commit_and_push(ctx, "factory(42): spec")
+    (ctx.worktree / "Makefile").write_text("test:\n\t@echo nope\n", encoding="utf-8")
+    ctx.repo.commit_all(ctx.worktree, "operator rewrites the Makefile")
+    fresh = make_context(workspace)
+    fresh.prepared = False
+
+    with pytest.raises(FactoryError, match="protected paths changed on factory/42: Makefile"):
+        stages.prepare(fresh, need_state=True, fetch=False)
+
+
+def test_abandons_policy_starts_where_every_other_command_refuses(workspace):
+    """`abandon` deletes the branch; a dirty worktree or a protected path it is about to throw away must
+    not stop it (cli._PREPARE_POLICY)."""
+    ctx = make_context(workspace)
+    ctx.state = base_state(ctx)
+    stages.commit_and_push(ctx, "factory(42): spec")
+    (ctx.worktree / "Makefile").write_text("test:\n\t@echo nope\n", encoding="utf-8")
+    ctx.repo.commit_all(ctx.worktree, "operator rewrites the Makefile")
+    (ctx.worktree / "src" / "app.py").write_text("half-finished\n", encoding="utf-8")
+    fresh = make_context(workspace)
+    fresh.prepared = False
+
+    stages.prepare(
+        fresh,
+        need_state=False,
+        fetch=False,
+        commit_operator_edits=False,
+        strict_clean=False,
+        check_protected=False,
+    )
+
+    assert fresh.state is not None and fresh.worktree is not None
+    assert not fresh.repo.is_clean(fresh.worktree)  # nothing was committed and nothing discarded
+
+
+def test_prepare_does_not_publish_a_branch_that_has_no_state_yet(workspace):
+    """An interrupted first `spec` leaves a branch with nothing on it. Publishing it would leave an empty
+    factory/42 on the remote for someone to clean up, and would make `poll` see work where there is none."""
+    ctx = make_context(workspace)
+    ctx.prepared = False
+    ctx.state = None
+    assert not ctx.repo.remote_branch_exists(BRANCH)
+
+    stages.prepare(ctx, need_state=False, fetch=True)
+
+    assert ctx.state is None
+    assert not ctx.repo.remote_branch_exists(BRANCH)
+
+
+def test_prepare_publishes_a_local_only_commit_once_there_is_state(workspace):
+    ctx = make_context(workspace)
+    ctx.state = base_state(ctx)
+    ctx.state.save(ctx.worktree)
+    ctx.repo.commit_all(ctx.worktree, "factory(42): spec")  # local only: nothing pushed yet
+    fresh = make_context(workspace)
+    fresh.prepared = False
+
+    stages.prepare(fresh, need_state=True, fetch=True)
+
+    assert fresh.repo.remote_branch_exists(BRANCH)
+    assert fresh.repo.rev_parse(f"origin/{BRANCH}") == fresh.repo.head(fresh.worktree)

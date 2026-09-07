@@ -18,9 +18,10 @@ committed prompt file; the output shape lives in the schema file.
 Subprocess contract (both harnesses, and checks.run_checks): STREAM, DON'T BUFFER. Open transcript_path ("wb") and
 a sibling ".stderr" file, Popen(argv, cwd=cwd, env=env, stdin=DEVNULL, stdout=tf, stderr=ef, start_new_session=True),
 proc.wait(timeout=timeout_s). On TimeoutExpired: os.killpg(os.getpgid(proc.pid), SIGTERM); wait 10 s; SIGKILL the group;
-raise HarnessError("<harness> timed out after Ns", transcript_path=...). The transcript is complete on disk on every
-path including timeout. Never capture_output=True: a 45-minute JSONL stream does not belong in memory, and a surviving
-grandchild holding the pipe would block communicate() past the timeout.
+raise HarnessError("<harness> timed out after Ns", transcript_path=...). On ANY other exception out of wait()
+(KeyboardInterrupt first among them): kill the group the same way and re-raise. The transcript is complete on disk on
+every path including timeout and interrupt. Never capture_output=True: a 45-minute JSONL stream does not belong in
+memory, and a surviving grandchild holding the pipe would block communicate() past the timeout.
 """
 
 from __future__ import annotations
@@ -244,6 +245,11 @@ def run_streaming(
     """The shared subprocess contract from the module docstring. Returns (exit_code, duration_s); raises HarnessError on
     timeout (after killing the process group) with transcript_path=stdout_path. Also used by checks.run_checks.
 
+    NOTHING outlives this call: any exception raised while waiting — TimeoutExpired, a Ctrl-C in the operator's
+    terminal, a SIGTERM handler in a `poll` run — kills the child's whole process group before propagating. The
+    child leads its own session (start_new_session=True), so an interrupt that skipped the kill would leave a live
+    `claude` and its `make`/`pytest` grandchildren writing into a worktree the factory has stopped watching.
+
     A binary that cannot be executed raises FactoryError naming it (its message is also written to stderr_path, so a
     caller that keeps the log rather than the exception still sees why).
     """
@@ -273,6 +279,13 @@ def run_streaming(
                 f"partial output: {stdout_path}",
                 transcript_path=stdout_path,
             ) from None
+        except BaseException:
+            # Ctrl-C (KeyboardInterrupt), a SIGTERM handler, or anything else raised out of wait(): the child
+            # is a group leader in its own session, so nothing else would ever reap it or its grandchildren.
+            # An orphaned `claude`/`make` holding the worktree is exactly what the next command's
+            # interrupted-stage recovery cannot clean up (design §15). Kill the group, then re-raise unchanged.
+            _kill_process_group(proc)
+            raise
     return exit_code, time.monotonic() - started
 
 

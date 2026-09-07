@@ -17,6 +17,10 @@ from .errors import FactoryError, HarnessError
 from .harness import run_streaming
 
 PROTECTED_PATHS: tuple[str, ...] = (
+    # GNU make reads GNUmakefile, then makefile, then Makefile, and stops at the first that exists — all
+    # three are "the gate runs whatever the Makefile says" (design §9), so all three are protected.
+    "GNUmakefile",
+    "makefile",
     "Makefile",
     "factory.toml",
     "AGENTS.md",
@@ -28,6 +32,10 @@ PROTECTED_PATHS: tuple[str, ...] = (
     ".codex/",
     ".github/",
 )
+# Protected wherever they sit, not only at the root: both CLIs load the instruction file of every directory
+# on the way to a file they read, so `docs/AGENTS.md` configures the next session exactly as the root one does.
+PROTECTED_BASENAMES: tuple[str, ...] = ("AGENTS.md", "CLAUDE.md")
+_PROTECTED_BASENAMES_FOLDED = frozenset(name.casefold() for name in PROTECTED_BASENAMES)
 # Tooling droppings the factory itself creates by running the checks (and its own .factory/tmp inside the worktree).
 # Never the operator's edits, never a stage's output. Written to the checkout's .git/info/exclude by
 # Repo.ensure_excludes and ignored by every clean/dirty comparison via is_transient().
@@ -55,9 +63,10 @@ _LOG_NAME_RE = re.compile(r"^(?P<stage>[A-Za-z]+)-(?P<round>\d+)(?P<suffix>-.*)?
 # A markdown ATX heading of level 2 or deeper: "## Proof", "   ### proof ###".
 _HEADING_RE = re.compile(r"^ {0,3}#{2,6}[ \t]+(?P<text>.*?)[ \t]*#*[ \t]*$")
 _REQUIRED_PLAN_SECTIONS = ("## Files that change", "## Proof")
-# A path as a plan can spell one: word characters, separators, dots and dashes. Everything else — backticks,
-# quotes, brackets, parentheses, commas, em dashes — is markdown around it.
-_PLAN_TOKEN_RE = re.compile(r"[\w./\\-]+")
+# One character a path can be spelled with: word characters (\w, so non-ASCII names count), separators, dots
+# and dashes. Everything else — backticks, quotes, brackets, parentheses, commas, em dashes, whitespace, the
+# end of a line — is markdown around the path and therefore a boundary.
+_PATH_CHAR_RE = re.compile(r"[\w./\\-]")
 _GLOB_CHARS = "*?["
 
 
@@ -233,13 +242,22 @@ def _matches_prefix(path: str, entry: str) -> bool:
 
 
 def is_protected(path: str, config: Config) -> bool:
-    """PROTECTED_PATHS + config.protected_paths. Entries ending in '/' match the directory prefix;
-    others match the exact path or the path as a directory prefix (".github" matches ".github/x.yml")."""
+    """PROTECTED_PATHS + PROTECTED_BASENAMES + config.protected_paths. Entries ending in '/' match the
+    directory prefix; others match the exact path or the path as a directory prefix (".github" matches
+    ".github/x.yml"); PROTECTED_BASENAMES match the last component at any depth.
+
+    Matching is case-insensitive (both sides casefolded): `.CLAUDE/settings.json`, `makefile` and `Makefile`
+    are one file on a case-insensitive filesystem and one gate everywhere else, and an agent that renames
+    `Makefile` to `MAKEFILE` has still changed what `make` runs."""
     target = _normalize(path)
     if not target:
         return False
+    folded = target.casefold()
+    if folded.rpartition("/")[2] in _PROTECTED_BASENAMES_FOLDED:
+        return True
     return any(
-        _matches_prefix(target, entry) for entry in (*PROTECTED_PATHS, *config.protected_paths)
+        _matches_prefix(folded, entry.casefold())
+        for entry in (*PROTECTED_PATHS, *config.protected_paths)
     )
 
 
@@ -284,10 +302,17 @@ def allowed_edit_violations(
 ) -> list[str]:
     """Return offending paths for a write stage's changes (design §9). Scope: the write stage's OWN diff (the
     branch-level protected-path check before a session launches is stages.branch_protected_path_violations).
-      - paths in `ignore` (the factory's own rendered prompt file) and is_transient() paths are never violations
+      - paths in `ignore` (the factory's own rendered prompt file) are never violations
       - any protected path -> violation (both stages)
       - build: inside work/<issue>/ only plan.md is allowed; any other work/ path is a violation
       - fix:   any path under config.test_paths or anything under work/ is a violation
+
+    Every rule is evaluated over the path itself, with no transient-location escape: a path that breaks a rule
+    is a violation wherever it sits. is_transient() decides which droppings the worktree-clean comparison
+    ignores (deviation 12), and it must not double as an amnesty here — a `transient_paths` entry naming a
+    directory that also holds an AGENTS.md or the test suite would otherwise silently disable the gate for it.
+    A transient path that breaks no rule is not a violation, because no rule matches it.
+
     Paths are worktree-relative posix strings.
     """
     ignored = {_normalize(p) for p in (ignore or [])}
@@ -295,7 +320,7 @@ def allowed_edit_violations(
     violations: list[str] = []
     for raw in changed_paths:
         path = _normalize(raw)
-        if not path or path in ignored or path in violations or is_transient(path, config):
+        if not path or path in ignored or path in violations:
             continue
         if is_protected(path, config):
             violations.append(path)
@@ -310,30 +335,75 @@ def allowed_edit_violations(
 
 def paths_missing_from_plan(changed_paths: list[str], plan_md: str, *, issue: int) -> list[str]:
     """Design §9 build gate "every changed path listed in plan.md": a changed path (outside work/) is listed
-    when the exact relative path appears in plan_md as a whole token. Whole token, not substring: a plan that
-    names `src/app.py.bak` or `docs/src/app.py` does not license a change to `src/app.py`. Returns the
-    unlisted ones."""
+    when the path appears in plan_md literally, bounded on both sides by a character a path cannot contain.
+    Returns the unlisted ones.
+
+    Literal search, not a token scan, so a path is matchable whatever it is spelled with: `src/my report.py`
+    is listed by "- `src/my report.py` — rewritten", and a space, bracket or quote inside the path no longer
+    hides it from the gate (a token scan would split the path and never match it, failing every build that
+    touched such a file).
+
+    Bounded, not substring (deviation 23): a plan naming `src/app.py.bak` or `docs/src/app.py` does not
+    license a change to `src/app.py`.
+    """
     del issue  # the gate is the same for every issue; the parameter keeps the call sites explicit
-    listed = _plan_path_tokens(plan_md)
+    haystacks = _plan_haystacks(plan_md)
     missing: list[str] = []
     for raw in changed_paths:
         path = _normalize(raw)
         if not path or is_under(path, [WORK_DIR]) or path in missing:
             continue
-        if path not in listed:
+        if not _plan_lists(haystacks, path):
             missing.append(path)
     return missing
 
 
-def _plan_path_tokens(plan_md: str) -> set[str]:
-    """Every path-shaped token in the plan, normalized the way a changed path is. Markdown punctuation is not
-    part of a path: backticks, quotes, brackets, list markers and a trailing sentence stop all end a token."""
-    tokens: set[str] = set()
-    for raw in _PLAN_TOKEN_RE.findall(plan_md):
-        token = _normalize(raw.replace("\\", "/").rstrip(".,;:"))
-        if token:
-            tokens.add(token)
-    return tokens
+def _plan_haystacks(plan_md: str) -> tuple[str, ...]:
+    """The plan as written, plus a copy with '\\' turned into '/' so a plan spelling a path the Windows way
+    (`src\\app.py`) still lists the path git reports (`src/app.py`). The substitution is one character for
+    one, so an offset — and therefore the boundary test — means the same thing in either copy."""
+    slashed = plan_md.replace("\\", "/")
+    return (plan_md,) if slashed == plan_md else (plan_md, slashed)
+
+
+def _plan_lists(haystacks: tuple[str, ...], path: str) -> bool:
+    """`path`, or `./path` as a plan may write it, occurring as a whole path in any of the haystacks."""
+    return any(
+        _occurs_as_whole_path(text, candidate)
+        for text in haystacks
+        for candidate in (path, f"./{path}")
+    )
+
+
+def _occurs_as_whole_path(text: str, needle: str) -> bool:
+    """`needle` occurs in `text` with a path boundary on both sides. Every occurrence is tried: the first one
+    may be inside a longer path (`docs/src/app.py`) while a later one is the real listing."""
+    start = text.find(needle)
+    while start != -1:
+        if _boundary_before(text, start) and _boundary_after(text, start + len(needle)):
+            return True
+        start = text.find(needle, start + 1)
+    return False
+
+
+def _boundary_before(text: str, index: int) -> bool:
+    return index == 0 or not _is_path_char(text[index - 1])
+
+
+def _boundary_after(text: str, index: int) -> bool:
+    """The end of the text, or a character no path contains — backtick, quote, bracket, parenthesis, comma,
+    whitespace, end of line. A '.' also ends the path when it is itself followed by one of those: "we rewrite
+    src/app.py." names the file, while "src/app.py.bak" is a different one (deviation 23)."""
+    if index >= len(text):
+        return True
+    char = text[index]
+    if not _is_path_char(char):
+        return True
+    return char == "." and (index + 1 >= len(text) or not _is_path_char(text[index + 1]))
+
+
+def _is_path_char(char: str) -> bool:
+    return _PATH_CHAR_RE.match(char) is not None
 
 
 def plan_has_required_sections(plan_md: str) -> list[str]:

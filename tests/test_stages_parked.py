@@ -340,3 +340,50 @@ def test_force_runs_build_on_a_parked_issue(workspace):
 
     assert exc.value.gate == "baseline_failing"
     assert marker_ran(workspace), "--force must reach the stage, gate and all"
+
+
+# ---------------------------------------------------------------- the gated review flag
+
+
+def review_round(ctx: Context, *, round: int, important_open: int, fix_rounds_at: int) -> None:
+    """Record and commit a review the way stages.review does, so park() has nothing else pending."""
+    ctx.state.reviews.append(
+        ReviewRecord(
+            round=round,
+            sha=ctx.repo.head(ctx.worktree),
+            important_open=important_open,
+            important_resolved=0,
+            nits=0,
+            reraised_dropped=0,
+            fix_rounds_at=fix_rounds_at,
+        )
+    )
+    ctx.state.save(ctx.worktree)
+    ctx.repo.commit_all(ctx.worktree, f"factory({ISSUE}): review {round}")
+
+
+@pytest.mark.parametrize("gate", stages.REVIEW_LOOP_GATES)
+def test_park_marks_the_review_that_raised_a_review_loop_gate(workspace, gate):
+    """`run` reads the flag back. It is the only thing that tells "the operator dismissed a finding" from
+    "nothing has happened": a `dismiss` moves HEAD without changing one line of code, so the gate would
+    otherwise be re-raised over the very review the operator answered."""
+    ctx = make_context(workspace, red=False)
+    spec_plan_build(ctx)
+    review_round(ctx, round=1, important_open=1, fix_rounds_at=1)
+
+    park_now(ctx, gate)
+
+    committed = State.load(ctx.worktree, ISSUE)
+    assert committed.reviews[-1].gated is True
+    assert stages.is_parked(ctx) is True  # the flag travelled in park's state-only commit
+
+
+@pytest.mark.parametrize("gate", ["open_questions", "baseline_failing"])
+def test_park_leaves_the_review_alone_for_a_gate_the_loop_did_not_raise(workspace, gate):
+    ctx = make_context(workspace, red=False)
+    spec_plan_build(ctx)
+    review_round(ctx, round=1, important_open=0, fix_rounds_at=0)
+
+    park_now(ctx, gate)
+
+    assert State.load(ctx.worktree, ISSUE).reviews[-1].gated is False

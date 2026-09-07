@@ -242,7 +242,7 @@ def test_subscription_auth_forwards_no_provider_key(bench):
 
 
 def test_only_the_first_configured_check_runs_and_it_runs_in_the_probe_worktree(bench):
-    bench.run()
+    report = bench.run()
 
     runs = bench.make_runs()
     assert len(runs) == 1, "only config.checks[0] is probed"
@@ -252,6 +252,23 @@ def test_only_the_first_configured_check_runs_and_it_runs_in_the_probe_worktree(
     assert args == "test"
     assert provider_key == "", "checks never see a provider key (design §8)"
     assert (bench.probe_worktree() / "Makefile").read_text() == ".PHONY: test\ntest:\n\t@true\n"
+    assert (
+        "ok: write probe: check `make test` ran against a seeded no-op Makefile — "
+        "proves the sandbox can exec make, not the repo's checks"
+    ) in report.lines, "the line must not read as if the repository's own checks had passed"
+
+
+def test_a_non_make_check_line_says_what_it_proves(bench, tmp_path):
+    recorder = tmp_path / "bin" / "record-check"
+    recorder.write_text("#!/bin/sh\nexit 0\n")
+    recorder.chmod(0o755)
+    bench.config.checks = [["record-check"]]
+
+    report = bench.run()
+
+    line = next(line for line in report.lines if "check `record-check`" in line)
+    assert "no repository source" in line
+    assert "seeded" not in line, "nothing was seeded for a check that is not `make`"
 
 
 def test_a_non_make_check_is_run_exactly_as_configured(bench, tmp_path):
@@ -267,6 +284,58 @@ def test_a_non_make_check_is_run_exactly_as_configured(bench, tmp_path):
     assert not (bench.probe_worktree() / "Makefile").exists(), (
         "only a make check needs seeded targets"
     )
+
+
+def test_the_probes_go_through_the_real_harness_argv_builder(bench):
+    """doctor drives the harness through harness.get_harness(...).run(...) — the same adapter, and therefore the
+    same argv, a stage gets. A flag the CLI dropped has to fail here, not 40 minutes into a build."""
+    argvs: list[list[str]] = []
+
+    class RealArgvHarness(harness_module.ClaudeCode):
+        def version(self, env: dict) -> str:
+            return CLAUDE_VERSION
+
+        def run(self, **kwargs):
+            argvs.append(
+                self.argv(
+                    cwd=kwargs["cwd"],
+                    prompt_file=kwargs["prompt_file"],
+                    schema=json.loads(Path(kwargs["schema_file"]).read_text()),
+                    mode=kwargs["mode"],
+                    model=kwargs["model"],
+                    auth=kwargs["auth"],
+                    max_turns=kwargs["max_turns"],
+                    max_budget_usd=kwargs["max_budget_usd"],
+                    agents_md=kwargs["agents_md"],
+                )
+            )
+            (kwargs["cwd"] / "probe.txt").write_text("factory-probe\n")
+            return HarnessResult(
+                output={"ok": True, "note": "probe ran"},
+                transcript_path=kwargs["transcript_path"],
+                exit_code=0,
+                cli_version=CLAUDE_VERSION,
+            )
+
+    bench.harness = RealArgvHarness()
+    bench.parent_env["ANTHROPIC_API_KEY"] = "sk-probe"
+
+    report = bench.run(auth="api")
+
+    assert report.ok, report.render()
+    read_argv, write_argv = argvs
+    assert read_argv[:3] == [
+        "claude",
+        "-p",
+        "Follow the instructions in doctor-read-prompt.md exactly.",
+    ]
+    assert harness_module.CLAUDE_READ_ALLOWED in read_argv
+    assert harness_module.CLAUDE_WRITE_ALLOWED in write_argv
+    for argv in argvs:
+        assert "--bare" in argv, "api mode, exactly as a stage runs it"
+        assert "--append-system-prompt-file" in argv
+        assert all(flag in argv for flag in harness_module.CLAUDE_ALWAYS)
+    assert write_argv[write_argv.index("--max-turns") + 1] == str(HarnessConfig().max_turns_write)
 
 
 def test_write_probe_is_skipped_when_asked(bench):
