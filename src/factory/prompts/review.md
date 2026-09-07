@@ -5,6 +5,12 @@ implementation, tests, and all controller-provided check evidence. Account for e
 criterion. Flag deleted, disabled, or weakened tests unless the approved scope justifies them.
 Review correctness, security, regression risk, and requirements/plan compliance.
 
+This review precedes publication. Judge implementation acceptance against the code, tests,
+approved artifacts, and controller local-check evidence. Required GitHub CI is a later
+publication gate enforced by Python on this same candidate. An absent PR or GitHub CI result
+at this stage is expected and does not itself block your verdict, including when the spec
+lists CI as a final acceptance requirement. Report concrete code or local-verification defects.
+
 Return JSON matching the supplied schema. Every finding includes a repository-relative file,
 positive line number, concrete evidence, and an actionable message. `important` means a defect
 that must be repaired before acceptance; `nit` is optional polish, capped at five findings.

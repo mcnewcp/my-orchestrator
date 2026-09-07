@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from factory.agents import AgentRunner, agent_environment, check_environment, prompt_text
 from factory.config import Config, canonical_json, digest, file_hash, image_identity
-from factory.errors import Blocked, FactoryError
+from factory.errors import Blocked, FactoryError, Interrupted
 from factory.git_ops import GitOps
 from factory.github import GitHub
 from factory.process import ProcessRunner
@@ -185,7 +185,12 @@ class Workflow:
                 "baseline_failed: repair the environment or supersede with a healthy base"
             )
         issue = run["frozen"]["issue"]
-        prompt = self._prompt(run, "prepare", f"Frozen issue:\n{json.dumps(issue)}")
+        prompt = self._prompt(
+            run,
+            "prepare",
+            f"Frozen issue:\n{json.dumps(issue)}\n\nController baseline evidence:\n"
+            + json.dumps(baseline),
+        )
         output = self.agents.run(
             "prepare",
             run["engine"],
@@ -624,32 +629,48 @@ class Workflow:
             run["branch"], cfg.base_branch, run["frozen"]["issue"]["title"], body, run_id=run["id"]
         )
         run = self._update(run, "draft_published", pr=pr)
-        self._assert_pr(run, self.github.pr(pr["number"]))
-        ci = self.github.wait_ci(
-            sha, cfg.required_ci, cfg.ci_timeout, poll_seconds=cfg.poll_seconds
-        )
-        self._evidence(run, "ci.json", ci)
-        self._accepted(run)
-        current = self.github.pr(pr["number"])
-        self._assert_pr(run, current)
-        if current["isDraft"]:
-            self.github.ready(pr["number"], expected_sha=sha)
-        current = self.github.pr(pr["number"])
-        self._assert_pr(run, current)
-        if current["isDraft"]:
-            raise Blocked("pr_still_draft")
-        # CI is re-read after conversion too; a changed head never gets recorded ready.
-        self.github.wait_ci(sha, cfg.required_ci, cfg.ci_timeout, poll_seconds=cfg.poll_seconds)
-        self._accepted(run)
-        self._assert_pr(run, self.github.pr(pr["number"]))
-        self._update(
-            run,
-            "ready",
-            state="ready",
-            next_stage="done",
-            pr=current,
-            metadata=self._metadata(run, active_stage=None),
-        )
+        try:
+            self._assert_pr(run, self.github.pr(pr["number"]))
+            ci = self.github.wait_ci(
+                sha, cfg.required_ci, cfg.ci_timeout, poll_seconds=cfg.poll_seconds
+            )
+            self._evidence(run, "ci.json", ci)
+            self._accepted(run)
+            current = self.github.pr(pr["number"])
+            self._assert_pr(run, current)
+            if current["isDraft"]:
+                self.github.ready(pr["number"], expected_sha=sha)
+            current = self.github.pr(pr["number"])
+            self._assert_pr(run, current)
+            if current["isDraft"]:
+                raise Blocked("pr_still_draft")
+            # CI is re-read after conversion too; a changed head never gets recorded ready.
+            self.github.wait_ci(sha, cfg.required_ci, cfg.ci_timeout, poll_seconds=cfg.poll_seconds)
+            self._accepted(run)
+            current = self.github.pr(pr["number"])
+            self._assert_pr(run, current)
+            if current["isDraft"]:
+                raise Blocked("pr_still_draft")
+            self._update(
+                run,
+                "ready",
+                state="ready",
+                next_stage="done",
+                pr=current,
+                metadata=self._metadata(run, active_stage=None),
+            )
+        except Interrupted:
+            # Lease loss/shutdown forbids further writes; resume reconciles the existing PR.
+            raise
+        except Exception as error:
+            try:
+                current = self.github.draft(pr["number"], run_id=run["id"])
+                self._update(run, "publication_draft_restored", pr=current)
+            except Interrupted:
+                raise
+            except Exception as restore_error:
+                raise Blocked(f"{error}; draft_restore_failed: {restore_error}") from error
+            raise
 
     def _assert_pr(self, run: dict, pr: dict) -> None:
         if (

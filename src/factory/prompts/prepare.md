@@ -8,6 +8,12 @@ Return a JSON object matching the supplied schema. `spec` and `plan` are complet
 documents; Python writes them. The spec states outcome, scope, concrete acceptance criteria,
 constraints, exclusions, and unresolved decisions. The plan names expected files, steps,
 risks, and evidence for every acceptance criterion. State existing baseline failures clearly.
+Use the controller-provided baseline results when describing verification already performed.
+
+Verification happens in order: implementation, controller local checks, agent review, then
+publication and required GitHub CI. Describe required CI as a publication gate. Agent review
+can accept code with passing local checks before a PR exists; the controller separately requires
+successful CI on the accepted candidate before marking its PR ready for human review.
 
 Product choices without an answer belong in `unresolved_decisions` and as bullets below the
 exact spec heading `## Unresolved decisions`. When every product choice needed for implementation

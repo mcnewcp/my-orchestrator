@@ -4,7 +4,7 @@ checkout = "/workspace/target"
 workspace_root = "/workspace"
 # Match FACTORY_WORKSPACE in .env so status prints host-editable document paths.
 host_workspace_root = "/home/operator/factory-workspace"
-base_branch = "main"
+base_branch = "prototype/v0-cdx"
 agent = "codex"
 auth = "subscription"
 stage_timeout = 1200
@@ -12,13 +12,13 @@ ci_timeout = 600
 poll_seconds = 3
 
 # Exact GitHub check-run names required on the accepted candidate SHA.
-required_ci = ["test"]
+required_ci = ["factory-v0-tests"]
 
 # Include every verification entry point/dependency file for this target.
 # Instructions, REVIEW.md, factory.toml, and .github/** are always protected too.
 protected_paths = ["pyproject.toml", "uv.lock", "requirements*.txt", "scripts/check*"]
 
 [[checks]]
-name = "tests"
-command = ["python", "-m", "pytest", "-q"]
+name = "factory-v0-tests"
+command = ["sh", "scripts/check-factory-v0.sh"]
 timeout = 300

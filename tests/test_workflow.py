@@ -142,6 +142,12 @@ class FakeGitHub:
         self.current["isDraft"] = False
         return dict(self.current)
 
+    def draft(self, number, *, run_id):
+        assert number == self.current["number"]
+        assert f"<!-- factory-run:{run_id} -->" in self.current["body"].splitlines()
+        self.current["isDraft"] = True
+        return dict(self.current)
+
 
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
@@ -392,6 +398,42 @@ def test_missing_ci_leaves_draft_and_resume_reuses_accepted_candidate(rig):
     assert resumed["candidate_sha"] == candidate and resumed["attempt_count"] == 1
     assert rig.github.created == 1
     assert rig.runner.check_count == 2
+
+
+def test_ci_failure_after_ready_conversion_restores_a_blocked_draft(rig, monkeypatch):
+    run = prepared(rig)
+    wait_ci = rig.github.wait_ci
+
+    def fail_after_conversion(*args, **kwargs):
+        if not rig.github.current["isDraft"]:
+            rig.github.ci_success = False
+        return wait_ci(*args, **kwargs)
+
+    monkeypatch.setattr(rig.github, "wait_ci", fail_after_conversion)
+    approve(rig, run)
+    result = execute(rig, run)
+    assert result["state"] == "blocked"
+    assert "missing" in result["blocked_reason"]
+    assert rig.github.current["isDraft"]
+    assert result["pr"]["isDraft"]
+
+
+def test_pr_converted_back_to_draft_during_final_ci_cannot_be_recorded_ready(rig, monkeypatch):
+    run = prepared(rig)
+    wait_ci = rig.github.wait_ci
+
+    def redraft_after_conversion(*args, **kwargs):
+        if not rig.github.current["isDraft"]:
+            rig.github.current["isDraft"] = True
+        return wait_ci(*args, **kwargs)
+
+    monkeypatch.setattr(rig.github, "wait_ci", redraft_after_conversion)
+    approve(rig, run)
+    result = execute(rig, run)
+    assert result["state"] == "blocked"
+    assert "pr_still_draft" in result["blocked_reason"]
+    assert rig.github.current["isDraft"]
+    assert result["pr"]["isDraft"]
 
 
 def test_interruption_after_pr_creation_adopts_existing_pr_on_resume(rig):

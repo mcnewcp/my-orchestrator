@@ -223,6 +223,19 @@ class GitHub:
             raise Blocked("PR remains open")
         return current
 
+    def draft(self, number: int, *, run_id: str) -> dict:
+        current = self.pr(number)
+        if self.marker(run_id) not in current.get("body", "").splitlines():
+            raise Blocked("Cannot restore draft: PR does not match this run")
+        if current["state"] != "OPEN":
+            raise Blocked("Cannot restore draft: PR has closed or merged")
+        if not current["isDraft"]:
+            self._run(["pr", "ready", str(number), "--repo", self.repo, "--undo"])
+        updated = self.pr(number)
+        if updated["state"] != "OPEN" or not updated["isDraft"]:
+            raise Blocked("PR could not be restored to draft")
+        return updated
+
     def checks(self, sha: str, required: list[str], *, deadline: float | None = None) -> list[dict]:
         """All required contexts must succeed on this immutable commit revision."""
         if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", sha):

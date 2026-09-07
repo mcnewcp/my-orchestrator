@@ -289,6 +289,27 @@ def test_ready_refuses_changed_candidate_before_external_write():
     assert len(runner.calls) == 1
 
 
+def test_failed_publication_can_restore_its_pr_to_draft():
+    runner = FakeRunner([pull_request(isDraft=False), {}, pull_request()])
+    result = GitHub("owner/repo", runner).draft(17, run_id="run-1")
+    assert result["isDraft"] is True
+    assert runner.calls[1][0] == ["gh", "pr", "ready", "17", "--repo", "owner/repo", "--undo"]
+
+
+def test_draft_restoration_reuses_an_existing_draft_without_writing():
+    runner = FakeRunner([pull_request(), pull_request()])
+    assert GitHub("owner/repo", runner).draft(17, run_id="run-1")["isDraft"]
+    assert all(argv[1:3] == ["pr", "view"] for argv, _ in runner.calls)
+
+
+@pytest.mark.parametrize("overrides", [{"body": "Another run"}, {"state": "CLOSED"}])
+def test_draft_restoration_refuses_a_different_or_closed_pr(overrides):
+    runner = FakeRunner([pull_request(isDraft=False, **overrides)])
+    with pytest.raises(Blocked, match="Cannot restore draft"):
+        GitHub("owner/repo", runner).draft(17, run_id="run-1")
+    assert len(runner.calls) == 1
+
+
 def test_ci_transport_calls_share_the_overall_deadline():
     runner = ci_runner([check_run()])
     GitHub("owner/repo", runner, timeout=60).wait_ci(SHA, ["tests"], timeout=10)
