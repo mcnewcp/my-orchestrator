@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Offline test of the pinned CLI's real sandbox, without credentials or a model.
+set -euo pipefail
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+docker run --rm --init -i --network none --cap-drop ALL \
+  --security-opt no-new-privileges=true \
+  --security-opt apparmor=software-factory \
+  --security-opt "seccomp=${repo_root}/deploy/security/software-factory.seccomp.json" \
+  "${1:-software-factory:v0-prototype}" python - <<'PY'
+import pathlib
+import subprocess
+import tempfile
+
+work = pathlib.Path(tempfile.mkdtemp(prefix="sandbox-check-", dir="/workspace"))
+marker = work / "marker.txt"
+marker.write_text("ORBIT\n")
+outside = pathlib.Path(tempfile.mkdtemp(prefix="sandbox-outside-", dir="/home/factory"))
+subprocess.run(["git", "init", "--quiet", str(work)], check=True)
+
+def sandbox(mode, code):
+    result = subprocess.run(
+        ["codex", "sandbox", "-c", f'sandbox_mode="{mode}"',
+         "-c", "sandbox_workspace_write.network_access=false",
+         "--", "python", "-c", code],
+        cwd=work, text=True, capture_output=True, timeout=30,
+    )
+    if result.returncode:
+        raise SystemExit(result.stdout + result.stderr)
+    return result.stdout
+
+assert sandbox("read-only", "print(open('marker.txt').read(), end='')") == "ORBIT\n"
+print("PASS: read-only sandbox reads the marker", flush=True)
+
+deny_write = """
+from pathlib import Path
+try:
+    Path(TARGET).write_text('forbidden')
+except OSError as exc:
+    assert exc.errno in (1, 13, 30), exc
+else:
+    raise AssertionError('sandbox allowed a forbidden write')
+"""
+sandbox("read-only", deny_write.replace("TARGET", repr(str(marker))))
+assert marker.read_text() == "ORBIT\n"
+print("PASS: read-only sandbox denies workspace writes", flush=True)
+
+sandbox("workspace-write", "from pathlib import Path; Path('allowed.txt').write_text('allowed')")
+assert (work / "allowed.txt").read_text() == "allowed"
+sandbox("workspace-write", deny_write.replace("TARGET", repr(str(outside / "forbidden.txt"))))
+sandbox("workspace-write", deny_write.replace("TARGET", repr(str(work / ".git" / "config"))))
+print("PASS: workspace-write allows workspace edits and denies outside/.git writes", flush=True)
+PY

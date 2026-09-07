@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "software-factory"
+version = "0.1.0"
+description = "A single-worker, approval-gated issue-to-PR factory prototype"
+requires-python = ">=3.12"
+dependencies = ["typer>=0.16,<1", "pydantic>=2.11,<3", "psycopg[binary]>=3.2,<4"]
+
+[project.scripts]
+factory = "factory.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8.4,<10", "ruff>=0.12,<1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/factory"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["postgres: requires FACTORY_TEST_DATABASE_URL"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

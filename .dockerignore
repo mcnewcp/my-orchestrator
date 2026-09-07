@@ -1,0 +1,13 @@
+.git
+.agents
+.codex
+.scratch
+.venv
+.auth
+**/__pycache__
+.pytest_cache
+.ruff_cache
+.env
+factory.toml
+dist
+*.egg-info

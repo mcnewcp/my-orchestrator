@@ -1,0 +1,47 @@
+name: Test
+on:
+  workflow_call:
+  pull_request:
+  push:
+    branches: [main, prototype/v0-cdx]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6-bookworm
+        env:
+          POSTGRES_USER: factory
+          POSTGRES_PASSWORD: factory-test
+          POSTGRES_DB: factory_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U factory -d factory_test"
+          --health-interval 5s --health-timeout 5s --health-retries 15
+    env:
+      FACTORY_TEST_DATABASE_URL: postgresql://factory:factory-test@localhost:5432/factory_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install uv==0.12.10
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run pytest -q
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --tag factory:test .
+      - run: docker run --rm factory:test factory --help
+      - run: docker run --rm factory:test codex --version
+      - run: docker run --rm factory:test claude --version
+      - name: Verify native sandbox boundaries without credentials or a model
+        run: |
+          sudo install -m 0644 deploy/security/software-factory.apparmor /etc/apparmor.d/software-factory
+          sudo apparmor_parser -r /etc/apparmor.d/software-factory
+          bash scripts/check-codex-sandbox factory:test

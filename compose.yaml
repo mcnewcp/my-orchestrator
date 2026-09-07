@@ -1,0 +1,54 @@
+name: software-factory
+services:
+  postgres:
+    image: postgres:17.6-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: factory
+      POSTGRES_USER: factory
+      POSTGRES_PASSWORD: ${FACTORY_POSTGRES_PASSWORD:?Set FACTORY_POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U factory -d factory"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    networks: [database]
+
+  factory:
+    image: ${FACTORY_IMAGE:?Set FACTORY_IMAGE to an image@sha256 digest}
+    init: true
+    # Load the named host profile first; see deploy/security/README.md.
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - apparmor=software-factory
+      - seccomp=./deploy/security/software-factory.seccomp.json
+    restart: unless-stopped
+    stop_grace_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      FACTORY_DATABASE_URL: postgresql://factory:${FACTORY_POSTGRES_PASSWORD}@postgres/factory
+      FACTORY_IMAGE_ID: ${FACTORY_IMAGE}
+      FACTORY_CONFIG: /etc/factory/factory.toml
+      CODEX_API_KEY: ${CODEX_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GH_TOKEN: ${GH_TOKEN:-}
+    volumes:
+      - ${FACTORY_WORKSPACE:?Set FACTORY_WORKSPACE to an absolute host directory}:/workspace
+      - ${FACTORY_CONFIG_FILE:-./factory.toml}:/etc/factory/factory.toml:ro
+      - ${FACTORY_CODEX_AUTH:-./.auth/codex}:/auth/codex
+      - ${FACTORY_CLAUDE_AUTH:-./.auth/claude}:/auth/claude
+      - ${FACTORY_GH_AUTH:-./.auth/gh}:/auth/gh
+    networks: [database, outbound]
+
+networks:
+  database:
+    internal: true
+  outbound:
+
+volumes:
+  postgres-data:

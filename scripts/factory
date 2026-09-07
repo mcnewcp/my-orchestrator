@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve a symlink installed on PATH back to this deployment checkout.
+script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
+deployment_dir="${FACTORY_DEPLOYMENT_DIR:-$(dirname -- "$script_path")/..}"
+deployment_dir="$(cd -- "$deployment_dir" && pwd -P)"
+compose_file="$deployment_dir/compose.yaml"
+if [[ ! -f "$compose_file" ]]; then
+    printf 'Missing Compose file: %s; set FACTORY_DEPLOYMENT_DIR.\n' "$compose_file" >&2
+    exit 1
+fi
+
+exec docker compose --project-directory "$deployment_dir" -f "$compose_file" \
+    exec -T factory factory "$@"

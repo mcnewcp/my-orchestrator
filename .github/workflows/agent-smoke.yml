@@ -1,0 +1,100 @@
+name: Agent smoke
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Released GHCR image@sha256 digest"
+        required: true
+        type: string
+permissions:
+  contents: read
+  packages: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        agent: [codex, claude]
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull the immutable release and locate its source
+        id: image
+        env:
+          IMAGE: ${{ inputs.image }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          [[ "$IMAGE" =~ ^ghcr.io/[a-zA-Z0-9_./-]+@sha256:[a-f0-9]{64}$ ]]
+          [[ "$IMAGE" == "ghcr.io/${REPOSITORY,,}@sha256:"* ]]
+          docker pull "$IMAGE"
+          revision=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE")
+          [[ "$revision" =~ ^[a-f0-9]{40}$ ]]
+          printf 'revision=%s\n' "$revision" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.image.outputs.revision }}
+          persist-credentials: false
+      - name: Load the release's native sandbox profile
+        run: |
+          sudo install -m 0644 deploy/security/software-factory.apparmor /etc/apparmor.d/software-factory
+          sudo apparmor_parser -r /etc/apparmor.d/software-factory
+      - name: Verify the real Codex sandbox without credentials or a model
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: bash scripts/check-codex-sandbox "$IMAGE"
+      - name: Prepare native authentication directories
+        env:
+          CODEX_AUTH_JSON_B64: ${{ matrix.agent == 'codex' && secrets.CODEX_AUTH_JSON_B64 || '' }}
+          CLAUDE_CREDENTIALS_JSON_B64: ${{ matrix.agent == 'claude' && secrets.CLAUDE_CREDENTIALS_JSON_B64 || '' }}
+          ENGINE: ${{ matrix.agent }}
+        run: |
+          python3 - <<'PY'
+          import base64, os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "factory-auth"
+          for engine in ("codex", "claude"):
+              (root / engine).mkdir(parents=True, exist_ok=True)
+              (root / engine).chmod(0o700)
+          engine = os.environ["ENGINE"]
+          key, name = (
+              ("CODEX_AUTH_JSON_B64", "auth.json") if engine == "codex"
+              else ("CLAUDE_CREDENTIALS_JSON_B64", ".credentials.json")
+          )
+          value = os.environ.get(key)
+          if not value:
+              raise SystemExit(f"Required subscription smoke secret is absent: {key}")
+          target = root / engine / name
+          target.write_bytes(base64.b64decode(value, validate=True))
+          target.chmod(0o600)
+          PY
+          mkdir -p "$RUNNER_TEMP/factory-evidence"
+          sudo chown -R 1000:1000 "$RUNNER_TEMP/factory-auth" "$RUNNER_TEMP/factory-evidence"
+      - name: Smoke the selected native session inside the released image
+        env:
+          IMAGE: ${{ inputs.image }}
+          ENGINE: ${{ matrix.agent }}
+        run: |
+          docker run --rm --init --cap-drop ALL \
+            --security-opt no-new-privileges=true \
+            --security-opt apparmor=software-factory \
+            --security-opt "seccomp=$GITHUB_WORKSPACE/deploy/security/software-factory.seccomp.json" \
+            -v "$RUNNER_TEMP/factory-auth/codex:/auth/codex" \
+            -v "$RUNNER_TEMP/factory-auth/claude:/auth/claude" \
+            -v "$RUNNER_TEMP/factory-evidence:/evidence" \
+            "$IMAGE" factory smoke --agent "$ENGINE" --auth subscription --output /evidence
+      - name: Preserve native session evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-smoke-${{ matrix.agent }}-subscription
+          path: ${{ runner.temp }}/factory-evidence
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove temporary authentication
+        if: always()
+        run: sudo rm -rf -- "$RUNNER_TEMP/factory-auth"
