@@ -1,0 +1,16 @@
+# factory-poll@<repo>.timer — design §13: every 15 minutes.
+# Install: /etc/systemd/system/factory-poll@.timer, then
+#   systemctl enable --now factory-poll@<repo>.timer
+[Unit]
+Description=Run factory poll for %i every 15 minutes
+Documentation=https://github.com/mcnewcp/my-orchestrator/blob/main/deploy/README.md
+
+[Timer]
+OnCalendar=*:0/15
+# Catch up on the tick a reboot or a downed host missed, instead of waiting for the next quarter hour.
+Persistent=true
+AccuracySec=1min
+Unit=factory-poll@%i.service
+
+[Install]
+WantedBy=timers.target

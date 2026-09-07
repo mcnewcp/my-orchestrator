@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""Fake `gh` CLI for the factory test suite. Contract: tests/FAKES.md.
+
+The whole of GitHub is `gh_state.json` in the fake directory, read and rewritten atomically on
+every mutating call; every invocation is appended to `gh_calls.jsonl`. Only the subcommands the
+factory uses (design §5 gh.py) are implemented — anything else exits 2 naming the argv, so a new
+call site is impossible to miss.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+VERSION_LINE = "gh version 9.9.9 (2026-09-06)"
+STATE_FILE = "gh_state.json"
+CALLS_FILE = "gh_calls.jsonl"
+POINTER_NAME = ".fake_dir"
+DEFAULT_STATE = {
+    "repo": "owner/name",
+    "auth_ok": True,
+    "issues": {},
+    "labels": [],
+    "prs": {},
+    "next_pr_number": 117,
+    "fail_next": [],
+}
+ISSUE_DEFAULTS = {"number": 0, "title": "", "body": "", "url": "", "labels": [], "state": "OPEN"}
+PR_DEFAULTS = {
+    "number": 0,
+    "url": "",
+    "isDraft": True,
+    "state": "OPEN",
+    "headRefName": "",
+    "baseRefName": "main",
+    "title": "",
+    "body": "",
+    "comments": [],
+}
+
+
+class GhError(Exception):
+    """Print `message` on stderr and exit with `code` (1 = gh's own failures, 2 = unsupported)."""
+
+    def __init__(self, message: str, code: int = 1):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+# ---------------------------------------------------------------- fake directory
+
+
+def script_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    for raw in (sys.argv[0] if sys.argv else "", __file__):
+        if not raw:
+            continue
+        try:
+            parent = Path(raw).resolve().parent
+        except OSError:
+            continue
+        if parent not in dirs:
+            dirs.append(parent)
+    return dirs
+
+
+def fake_dir() -> Path:
+    for directory in script_dirs():
+        pointer = directory.parent / POINTER_NAME
+        try:
+            target = pointer.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if target:
+            return Path(target)
+    from_env = os.environ.get("FACTORY_FAKE_DIR", "").strip()
+    if from_env:
+        return Path(from_env)
+    searched = ", ".join(str(d.parent / POINTER_NAME) for d in script_dirs())
+    raise GhError(f"fake gh: no fake dir; looked for {searched} and $FACTORY_FAKE_DIR", 2)
+
+
+def atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def load_state(directory: Path) -> dict:
+    path = directory / STATE_FILE
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return json.loads(json.dumps(DEFAULT_STATE))
+    try:
+        state = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise GhError(f"fake gh: {path} is not JSON: {exc}", 2) from exc
+    merged = json.loads(json.dumps(DEFAULT_STATE))
+    merged.update(state)
+    return merged
+
+
+def save_state(directory: Path, state: dict) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    atomic_write(directory / STATE_FILE, json.dumps(state, indent=2) + "\n")
+
+
+def record_call(directory: Path, argv: list[str]) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    record = {"argv": argv, "argv0": sys.argv[0], "cwd": os.getcwd()}
+    with (directory / CALLS_FILE).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
+def consume_fail_next(directory: Path, state: dict, argv: list[str]) -> bool:
+    """`fail_next` holds subcommand prefixes ("pr create"); the first match fires once."""
+    joined = " ".join(argv)
+    for prefix in list(state.get("fail_next") or []):
+        if joined == prefix or joined.startswith(f"{prefix} "):
+            state["fail_next"].remove(prefix)
+            save_state(directory, state)
+            sys.stderr.write(f"fake gh: scripted failure for '{prefix}'\n")
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- argv helpers
+
+
+def flag_value(argv: list[str], *names: str) -> str | None:
+    for index, arg in enumerate(argv):
+        if arg in names:
+            return argv[index + 1] if index + 1 < len(argv) else None
+        for name in names:
+            if arg.startswith(f"{name}="):
+                return arg.split("=", 1)[1]
+    return None
+
+
+def require(value: str | None, what: str) -> str:
+    if value is None:
+        raise GhError(f"fake gh: missing {what}")
+    return value
+
+
+def json_fields(argv: list[str]) -> list[str]:
+    raw = require(flag_value(argv, "--json"), "--json field list")
+    return [field.strip() for field in raw.split(",") if field.strip()]
+
+
+def body_text(argv: list[str], *, required: bool = True) -> str:
+    inline = flag_value(argv, "--body", "-b")
+    if inline is not None:
+        return inline
+    from_file = flag_value(argv, "--body-file", "-F")
+    if from_file is not None:
+        path = Path(from_file)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise GhError(f"fake gh: cannot read --body-file {path}: {exc}") from exc
+    if required:
+        raise GhError("fake gh: one of --body or --body-file is required")
+    return ""
+
+
+def issue_number(argv: list[str], subcommand: str) -> str:
+    if not argv or argv[0].startswith("-"):
+        raise GhError(f"fake gh: {subcommand} needs a number")
+    return str(int(argv[0])) if argv[0].isdigit() else argv[0]
+
+
+# ---------------------------------------------------------------- projection
+
+
+def project(obj: dict, fields: list[str], defaults: dict, kind: str) -> dict:
+    out: dict = {}
+    for field in fields:
+        if field == "labels":
+            out[field] = [{"name": name} for name in obj.get("labels", [])]
+        elif field == "comments":
+            out[field] = [{"body": c.get("body", "")} for c in obj.get("comments", [])]
+        elif field in obj:
+            out[field] = obj[field]
+        elif field in defaults:
+            out[field] = defaults[field]
+        else:
+            raise GhError(f"fake gh: unknown {kind} field '{field}'")
+    return out
+
+
+def get_issue(state: dict, number: str) -> dict:
+    issue = state.get("issues", {}).get(number)
+    if issue is None:
+        raise GhError(f"fake gh: no issue {number} in {STATE_FILE}")
+    return issue
+
+
+def get_pr(state: dict, number: str) -> dict:
+    pr = state.get("prs", {}).get(number)
+    if pr is None:
+        raise GhError(f"fake gh: no pull request {number} in {STATE_FILE}")
+    return pr
+
+
+# ---------------------------------------------------------------- subcommands
+
+
+def cmd_repo(directory: Path, state: dict, argv: list[str]) -> int:
+    if not argv or argv[0] != "view":
+        raise unsupported(argv, "repo")
+    print(json.dumps({"nameWithOwner": state["repo"]}))
+    return 0
+
+
+def cmd_auth(directory: Path, state: dict, argv: list[str]) -> int:
+    if not argv or argv[0] != "status":
+        raise unsupported(argv, "auth")
+    if not state.get("auth_ok", True):
+        sys.stderr.write("You are not logged into any GitHub hosts. Run gh auth login.\n")
+        return 1
+    print(f"github.com\n  Logged in to github.com account fake-operator ({state['repo']})")
+    return 0
+
+
+def cmd_issue(directory: Path, state: dict, argv: list[str]) -> int:
+    if not argv:
+        raise unsupported(argv, "issue")
+    action, rest = argv[0], argv[1:]
+    if action == "view":
+        number = issue_number(rest, "issue view")
+        print(
+            json.dumps(
+                project(get_issue(state, number), json_fields(rest), ISSUE_DEFAULTS, "issue")
+            )
+        )
+        return 0
+    if action == "list":
+        return issue_list(state, rest)
+    if action == "edit":
+        return issue_edit(directory, state, rest)
+    raise unsupported(argv, "issue")
+
+
+def issue_list(state: dict, argv: list[str]) -> int:
+    wanted_state = (flag_value(argv, "--state", "-s") or "open").upper()
+    label = flag_value(argv, "--label", "-l")
+    limit = flag_value(argv, "--limit", "-L")
+    fields = json_fields(argv)
+    issues = sorted(state.get("issues", {}).values(), key=lambda i: int(i.get("number", 0)))
+    matched = [
+        issue
+        for issue in issues
+        if (wanted_state == "ALL" or issue.get("state", "OPEN").upper() == wanted_state)
+        and (label is None or label in issue.get("labels", []))
+    ]
+    if limit is not None:
+        matched = matched[: int(limit)]
+    print(json.dumps([project(issue, fields, ISSUE_DEFAULTS, "issue") for issue in matched]))
+    return 0
+
+
+def issue_edit(directory: Path, state: dict, argv: list[str]) -> int:
+    number = issue_number(argv, "issue edit")
+    issue = get_issue(state, number)
+    labels = list(issue.get("labels", []))
+    removed = flag_value(argv, "--remove-label")
+    added = flag_value(argv, "--add-label")
+    if removed is None and added is None:
+        raise unsupported(["issue", "edit", *argv], "issue edit")
+    if removed is not None and removed in labels:
+        labels.remove(removed)
+    if added is not None and added not in labels:
+        labels.append(added)
+    issue["labels"] = labels
+    save_state(directory, state)
+    print(issue.get("url", ""))
+    return 0
+
+
+def cmd_label(directory: Path, state: dict, argv: list[str]) -> int:
+    if not argv:
+        raise unsupported(argv, "label")
+    action, rest = argv[0], argv[1:]
+    if action == "list":
+        fields = json_fields(rest)
+        if fields != ["name"]:
+            raise GhError(f"fake gh: label list supports --json name, not {','.join(fields)}")
+        print(json.dumps([{"name": name} for name in state.get("labels", [])]))
+        return 0
+    if action == "create":
+        if not rest or rest[0].startswith("-"):
+            raise GhError("fake gh: label create needs a name")
+        name = rest[0]
+        if name in state.get("labels", []) and "--force" not in rest:
+            sys.stderr.write(f'failed to create label: "{name}" already exists\n')
+            return 1
+        if name not in state.get("labels", []):
+            state.setdefault("labels", []).append(name)
+            save_state(directory, state)
+        print(f"https://github.com/{state['repo']}/labels/{name}")
+        return 0
+    raise unsupported(argv, "label")
+
+
+def cmd_pr(directory: Path, state: dict, argv: list[str]) -> int:
+    if not argv:
+        raise unsupported(argv, "pr")
+    action, rest = argv[0], argv[1:]
+    if action == "list":
+        return pr_list(state, rest)
+    if action == "create":
+        return pr_create(directory, state, rest)
+    if action == "view":
+        number = issue_number(rest, "pr view")
+        print(
+            json.dumps(
+                project(get_pr(state, number), json_fields(rest), PR_DEFAULTS, "pull request")
+            )
+        )
+        return 0
+    if action == "comment":
+        return pr_comment(directory, state, rest)
+    if action == "ready":
+        return pr_ready(directory, state, rest)
+    if action == "close":
+        return pr_close(directory, state, rest)
+    raise unsupported(argv, "pr")
+
+
+def pr_list(state: dict, argv: list[str]) -> int:
+    head = flag_value(argv, "--head", "-H")
+    wanted_state = (flag_value(argv, "--state", "-s") or "open").upper()
+    limit = flag_value(argv, "--limit", "-L")
+    fields = json_fields(argv)
+    prs = sorted(state.get("prs", {}).values(), key=lambda p: int(p.get("number", 0)), reverse=True)
+    matched = [
+        pr
+        for pr in prs
+        if (head is None or pr.get("headRefName") == head)
+        and (wanted_state == "ALL" or pr.get("state", "OPEN").upper() == wanted_state)
+    ]
+    if limit is not None:
+        matched = matched[: int(limit)]
+    print(json.dumps([project(pr, fields, PR_DEFAULTS, "pull request") for pr in matched]))
+    return 0
+
+
+def pr_create(directory: Path, state: dict, argv: list[str]) -> int:
+    number = int(state.get("next_pr_number", 117))
+    pr = {
+        "number": number,
+        "url": f"https://github.com/{state['repo']}/pull/{number}",
+        "headRefName": require(flag_value(argv, "--head", "-H"), "--head"),
+        "baseRefName": require(flag_value(argv, "--base", "-B"), "--base"),
+        "isDraft": "--draft" in argv or "-d" in argv,
+        "state": "OPEN",
+        "title": require(flag_value(argv, "--title", "-t"), "--title"),
+        "body": body_text(argv),
+        "comments": [],
+    }
+    state.setdefault("prs", {})[str(number)] = pr
+    state["next_pr_number"] = number + 1
+    save_state(directory, state)
+    print(pr["url"])
+    return 0
+
+
+def pr_comment(directory: Path, state: dict, argv: list[str]) -> int:
+    number = issue_number(argv, "pr comment")
+    pr = get_pr(state, number)
+    comments = pr.setdefault("comments", [])
+    comments.append({"body": body_text(argv)})
+    save_state(directory, state)
+    print(f"{pr.get('url', '')}#issuecomment-{len(comments)}")
+    return 0
+
+
+def pr_ready(directory: Path, state: dict, argv: list[str]) -> int:
+    number = issue_number(argv, "pr ready")
+    pr = get_pr(state, number)
+    pr["isDraft"] = False
+    save_state(directory, state)
+    print(f"Pull request {state['repo']}#{number} is marked as ready for review")
+    return 0
+
+
+def pr_close(directory: Path, state: dict, argv: list[str]) -> int:
+    number = issue_number(argv, "pr close")
+    pr = get_pr(state, number)
+    pr["state"] = "CLOSED"
+    comment = flag_value(argv, "--comment", "-c")
+    if comment:
+        pr.setdefault("comments", []).append({"body": comment})
+    save_state(directory, state)
+    print(f"Closed pull request {state['repo']}#{number}")
+    return 0
+
+
+def unsupported(argv: list[str], group: str = "") -> GhError:
+    shown = " ".join([group, *argv]) if group else " ".join(argv)
+    return GhError(f"fake gh: unsupported command: gh {shown}", 2)
+
+
+HANDLERS = {
+    "repo": cmd_repo,
+    "auth": cmd_auth,
+    "issue": cmd_issue,
+    "label": cmd_label,
+    "pr": cmd_pr,
+}
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("--version", "version"):
+        print(VERSION_LINE)
+        return 0
+    directory = fake_dir()
+    record_call(directory, argv)
+    if not argv:
+        raise unsupported(argv)
+    state = load_state(directory)
+    if consume_fail_next(directory, state, argv):
+        return 1
+    handler = HANDLERS.get(argv[0])
+    if handler is None:
+        raise unsupported(argv)
+    return handler(directory, state, argv[1:])
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except GhError as error:
+        sys.stderr.write(f"{error.message}\n")
+        raise SystemExit(error.code) from None

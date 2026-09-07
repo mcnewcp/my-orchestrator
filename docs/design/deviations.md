@@ -76,3 +76,22 @@ sentence on purpose. Section numbers refer to `prototype-v0.md`.
 - **Phase 2 is written but not exercised here**: `deploy/` and `image.yml` exist; this workstation's user is
   not in the `docker` group and no API key is present, so `api` auth, the container and the timer were
   not run. `subscription` auth was used for every live run.
+
+## Round-1 integration decisions (fixer, 2026-09-06)
+
+Four behaviours settled while reconciling the module implementations against the proof tests. Each is recorded
+in the docstring of the function that carries it.
+
+20. **"Parked stays parked" is per command, not only per `run`** (§11 names `run`). `build`, `review`, `fix` and
+    `finalize` call `check_parked()` before doing anything, so re-raising a gate costs no check run, no harness
+    call and no worktree dirt. `--force` (§11 lists it among the operator actions that re-open the loop) is
+    accepted only by `spec`/`plan`/`build`, so only `build` guards its call with `if not ctx.force`.
+21. **`park()`'s no-op re-park resets the worktree** before raising. A stage that wrote evidence before hitting
+    the gate (build's `checks/build-1-baseline.log`) would otherwise leave it uncommitted, and the next command's
+    `prepare()` would commit it as an operator edit — moving HEAD and un-parking the issue with no human action.
+22. **`doctor.json` records carry `"ok": true`** and `doctor_record_is_current` requires it alongside the two
+    version comparisons, so `poll`'s preflight cannot skip itself on a rescued or hand-written record. `doctor`
+    still writes a record only on a pass.
+23. **The plan/diff-sync gate matches whole tokens** (§9 "every changed path listed in `plan.md`"). A plan naming
+    `src/app.py.bak` or `docs/src/app.py` no longer licenses a change to `src/app.py`; markdown around a path
+    (backticks, brackets, a trailing comma or stop) is not part of it.

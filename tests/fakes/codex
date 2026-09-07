@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Fake `codex` CLI for the factory test suite. Contract: tests/FAKES.md.
+
+Shares `harness_queue.jsonl` with the fake `claude`, so a test that swaps harnesses scripts one
+queue. Locates the fake directory as ``<dirname(argv[0])>/../.fake_dir`` first and
+``$FACTORY_FAKE_DIR`` second (the factory's harness environment drops the variable, design §8).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+BINARY = "codex"
+VERSION_LINE = "codex-cli 9.9.9"
+QUEUE_FILE = "harness_queue.jsonl"
+CALLS_FILE = "harness_calls.jsonl"
+POINTER_NAME = ".fake_dir"
+RECORDED_ENV = ("ANTHROPIC_API_KEY", "CODEX_API_KEY", "GH_TOKEN", "FACTORY_FAKE_DIR", "CLAUDECODE")
+PROMPT_PREFIX = "Follow the instructions in "
+PROMPT_SUFFIX = " exactly."
+# Flags whose value is the last argv element when the prompt sentence was omitted.
+VALUE_FLAGS = (
+    "-o",
+    "--output-last-message",
+    "--output-schema",
+    "-m",
+    "--model",
+    "-C",
+    "--cd",
+    "--sandbox",
+    "--add-dir",
+    "-c",
+    "--config",
+    "-p",
+    "--profile",
+)
+USAGE = {
+    "input_tokens": 1200,
+    "cached_input_tokens": 0,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 40,
+    "reasoning_output_tokens": 0,
+}
+
+
+class FakeExit(Exception):
+    """Print `message` on stderr and exit with `code`."""
+
+    def __init__(self, message: str, code: int):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+# ---------------------------------------------------------------- fake directory
+
+
+def script_dirs() -> list[Path]:
+    """dirname(argv[0]) first, then dirname(__file__) — identical under a shebang, but argv[0] is
+    what the contract names and __file__ is what survives an odd exec."""
+    dirs: list[Path] = []
+    for raw in (sys.argv[0] if sys.argv else "", __file__):
+        if not raw:
+            continue
+        try:
+            parent = Path(raw).resolve().parent
+        except OSError:
+            continue
+        if parent not in dirs:
+            dirs.append(parent)
+    return dirs
+
+
+def fake_dir() -> Path:
+    for directory in script_dirs():
+        pointer = directory.parent / POINTER_NAME
+        try:
+            target = pointer.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if target:
+            return Path(target)
+    from_env = os.environ.get("FACTORY_FAKE_DIR", "").strip()
+    if from_env:
+        return Path(from_env)
+    searched = ", ".join(str(d.parent / POINTER_NAME) for d in script_dirs())
+    raise FakeExit(f"fake {BINARY}: no fake dir; looked for {searched} and $FACTORY_FAKE_DIR", 3)
+
+
+def atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_lines(path: Path) -> list[str]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [line for line in raw.splitlines() if line.strip()]
+
+
+def pop_queue(directory: Path) -> dict:
+    path = directory / QUEUE_FILE
+    lines = read_lines(path)
+    if not lines:
+        raise FakeExit("fake harness: queue empty", 3)
+    try:
+        entry = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        raise FakeExit(f"fake harness: first queue entry in {path} is not JSON: {exc}", 3) from exc
+    if not isinstance(entry, dict):
+        raise FakeExit(f"fake harness: first queue entry in {path} is not a JSON object", 3)
+    atomic_write(path, "".join(f"{line}\n" for line in lines[1:]))
+    return entry
+
+
+def record_call(directory: Path, record: dict) -> int:
+    """Append one line to harness_calls.jsonl; returns this invocation's zero-based index."""
+    path = directory / CALLS_FILE
+    index = len(read_lines(path))
+    directory.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+    return index
+
+
+def apply_writes(entry: dict, root: Path) -> None:
+    for rel, content in (entry.get("writes") or {}).items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    for rel in entry.get("deletes") or []:
+        try:
+            (root / rel).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def stall(entry: dict) -> None:
+    """sleep_s (timeout tests) then hang (interrupted-stage tests kill the process group)."""
+    seconds = float(entry.get("sleep_s") or 0)
+    if seconds > 0:
+        time.sleep(seconds)
+    while entry.get("hang"):
+        time.sleep(3600)
+
+
+# ---------------------------------------------------------------- argv
+
+
+def flag_value(argv: list[str], *names: str) -> str | None:
+    for index, arg in enumerate(argv):
+        if arg in names:
+            return argv[index + 1] if index + 1 < len(argv) else None
+        for name in names:
+            if arg.startswith(f"{name}="):
+                return arg.split("=", 1)[1]
+    return None
+
+
+def prompt_argument(argv: list[str]) -> str | None:
+    """`codex exec … -C <cwd> "<sentence>"`: the prompt is the last positional."""
+    if not argv:
+        return None
+    last = argv[-1]
+    if last.startswith("-") or last == "exec":
+        return None
+    if len(argv) >= 2 and argv[-2] in VALUE_FLAGS:
+        return None
+    return last
+
+
+def prompt_file_of(sentence: str | None) -> str | None:
+    if (
+        not sentence
+        or not sentence.startswith(PROMPT_PREFIX)
+        or not sentence.endswith(PROMPT_SUFFIX)
+    ):
+        return None
+    return sentence[len(PROMPT_PREFIX) : -len(PROMPT_SUFFIX)]
+
+
+def resolve(root: Path, raw: str) -> Path:
+    path = Path(raw)
+    return path if path.is_absolute() else root / path
+
+
+def read_prompt(root: Path, prompt_file: str | None) -> str | None:
+    if not prompt_file:
+        return None
+    try:
+        return resolve(root, prompt_file).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def read_schema(root: Path, raw: str | None):
+    if raw is None:
+        return None
+    try:
+        return json.loads(resolve(root, raw).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def call_record(argv: list[str], root: Path, schema) -> dict:
+    sentence = prompt_argument(argv)
+    prompt_file = prompt_file_of(sentence)
+    return {
+        "binary": BINARY,
+        "argv": argv,
+        "argv0": sys.argv[0],
+        "cwd": str(root),
+        "env_keys": sorted(os.environ),
+        "env": {name: ("present" if os.environ.get(name) else "absent") for name in RECORDED_ENV},
+        "prompt_sentence": sentence,
+        "prompt_file": prompt_file,
+        "prompt_text": read_prompt(root, prompt_file),
+        "schema": schema,
+    }
+
+
+# ---------------------------------------------------------------- events
+
+
+def emit_events(entry: dict, index: int) -> None:
+    """The JSONL shape codex 0.153.4 prints under --json (see the smoke transcripts)."""
+    output = entry.get("output")
+    text = (
+        entry["result"] if "result" in entry else json.dumps(output) if output is not None else ""
+    )
+    events = [
+        {"type": "thread.started", "thread_id": f"fake-thread-{index}"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"id": "item_0", "type": "agent_message", "text": text}},
+        {"type": "turn.completed", "usage": USAGE},
+    ]
+    for event in events:
+        print(json.dumps(event))
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if "--version" in argv:
+        print(VERSION_LINE)
+        return 0
+    directory = fake_dir()
+    root = Path.cwd()
+    schema = read_schema(root, flag_value(argv, "--output-schema"))
+    index = record_call(directory, call_record(argv, root, schema))
+    entry = pop_queue(directory)
+    apply_writes(entry, root)
+    stall(entry)
+    last_file = flag_value(argv, "-o", "--output-last-message")
+    output = entry.get("output")
+    if last_file and output is not None:
+        path = resolve(root, last_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(output), encoding="utf-8")
+    emit_events(entry, index)
+    return int(entry.get("exit_code", 0))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except FakeExit as exit_:
+        sys.stderr.write(f"{exit_.message}\n")
+        raise SystemExit(exit_.code) from None

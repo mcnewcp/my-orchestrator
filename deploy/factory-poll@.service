@@ -1,0 +1,24 @@
+# factory-poll@<repo>.service — design §13. `factory poll` is one-shot; systemd will not start a
+# oneshot that is still running, and poll takes .factory/run/poll.lock anyway.
+# Install: /etc/systemd/system/factory-poll@.service  (see deploy/README.md)
+[Unit]
+Description=Factory poll for %i
+Documentation=https://github.com/mcnewcp/my-orchestrator/blob/main/deploy/README.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=factory
+Group=factory
+EnvironmentFile=/etc/factory/%i.env
+ExecStart=/usr/local/bin/factory-host %i poll
+# A poll can legitimately run for hours: one stage may take stage_timeout_min (45 by default) and a
+# tick runs every eligible issue in turn. The factory's own timeouts are the bound, not systemd's.
+TimeoutStartSec=infinity
+# On stop, signal only the container (docker run forwards to the container's init), then give the
+# stage the same 120s the harness gets to die before the group is killed.
+KillMode=mixed
+TimeoutStopSec=120
+SyslogIdentifier=factory-poll@%i

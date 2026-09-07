@@ -10,30 +10,38 @@ thing under test, and a fake git would only prove the fake.
 tests/
   FAKES.md            this file
   conftest.py         fixtures below
-  fakes/claude        executable python3 script (no extension)
+  fakes/claude        executable python3 script (no extension) — the original
   fakes/codex         executable python3 script
   fakes/gh            executable python3 script
   test_*.py
+
+$FACTORY_FAKE_DIR/    per test, in pytest's tmp dir — nothing is written inside the repository
+  .fake_dir           one line: the path of this directory
+  bin/{claude,codex,gh}   executable COPIES of tests/fakes/*, first on PATH
+  harness_queue.jsonl  harness_calls.jsonl  gh_state.json  gh_calls.jsonl
 ```
 
-`conftest.py` puts `tests/fakes` first on `PATH` for every test that needs binaries and sets
-`FACTORY_FAKE_DIR` to a per-test temp directory. The fakes take ALL their instructions from files in that directory
-so tests can script them without monkeypatching the factory.
+`conftest.py` copies the three fakes into `$FACTORY_FAKE_DIR/bin` for every test and puts that directory first on
+`PATH`. The fakes take ALL their instructions from files in `FACTORY_FAKE_DIR`, so tests can script them without
+monkeypatching the factory. Copies, not symlinks: a fake resolves its own location with
+`Path(sys.argv[0]).resolve()`, and a symlink would resolve back to the shared `tests/fakes` — which is what makes
+the copy per test, and therefore safe when two pytest processes run against one checkout.
 
 ## Environment contract
 
 | variable | set by | read by |
 |---|---|---|
 | `FACTORY_FAKE_DIR` | conftest | all three fakes |
-| `PATH` | conftest (fakes dir first) | factory (`shutil.which`) |
+| `PATH` | conftest (`$FACTORY_FAKE_DIR/bin` first) | factory (`shutil.which`) |
 | `HOME` | conftest (temp home) | fakes ignore; real git uses it for identity |
 | `GIT_AUTHOR_NAME/EMAIL`, `GIT_COMMITTER_NAME/EMAIL` | conftest | real git |
 
 The factory passes harness subprocesses an allowlisted env (design §8) that does NOT include `FACTORY_FAKE_DIR`.
 Therefore the fakes must locate the fake dir another way when the variable is absent: they read the path from
-`<dirname of argv[0]>/../.fake_dir` (a one-line file conftest writes next to the fakes, i.e. `tests/.fake_dir`,
-gitignored) — fall back to `FACTORY_FAKE_DIR` when the file is missing. This also lets tests assert that
-`FACTORY_FAKE_DIR` and `GH_TOKEN` were *not* in the harness environment.
+`<dirname of argv[0]>/../.fake_dir`, which for the per-test copy in `$FACTORY_FAKE_DIR/bin` is
+`$FACTORY_FAKE_DIR/.fake_dir` — falling back to `FACTORY_FAKE_DIR` when that file is missing. `PATH` is therefore
+the only channel that reaches a harness subprocess, which is what lets tests assert that `FACTORY_FAKE_DIR` and
+`GH_TOKEN` were *not* in the harness environment.
 
 ## Files in `FACTORY_FAKE_DIR`
 
@@ -48,15 +56,24 @@ One JSON object per line = one harness invocation, popped from the top (file rew
  "sleep_s": 0,                                            // optional: sleep before exiting (timeout tests)
  "hang": false}                                           // optional: sleep forever (interrupted-stage tests kill the pid)
 ```
+Those eleven names — `output`, `writes`, `deletes`, `exit_code`, `is_error`, `sleep_s`, `hang`, `result`,
+`num_turns`, `permission_denials`, `model_usage` — are reserved: `Fakes.queue()` treats a dict whose keys are all
+drawn from them as a full entry and anything else as the model's structured output. A role schema whose top-level
+keys were a subset of that list could not be queued directly; wrap it as `{"output": {...}}`.
 Empty queue -> the fake exits 3 and prints `fake harness: queue empty` (a bug in the test or in the factory's call count).
 
 ### `harness_calls.jsonl` (appended by `claude` and `codex`, one line per invocation)
 ```json
-{"binary": "claude", "argv": [...], "cwd": "/abs/worktree", "env_keys": ["PATH","HOME",...],
- "env": {"ANTHROPIC_API_KEY": "present-or-absent", "GH_TOKEN": "present-or-absent", "CODEX_API_KEY": "…"},
+{"binary": "claude", "argv": [...], "argv0": "/abs/.../bin/claude", "cwd": "/abs/worktree",
+ "env_keys": ["PATH","HOME",...],
+ "env": {"ANTHROPIC_API_KEY": "present-or-absent", "CODEX_API_KEY": "…", "GH_TOKEN": "…",
+         "FACTORY_FAKE_DIR": "…", "CLAUDECODE": "…"},
+ "prompt_sentence": "Follow the instructions in work/42/prompts/spec-1.md exactly.",
  "prompt_file": "work/42/prompts/spec-1.md", "prompt_text": "<the file's content read from cwd>",
  "schema": {...}}   // parsed from --json-schema (claude) or --output-schema file (codex)
 ```
+`FACTORY_FAKE_DIR` and `CLAUDECODE` are recorded so a test can assert that §8's allowlist dropped them: the first
+proves the fake found its directory through the pointer file, the second that no nested session is advertised.
 Tests assert on this file: number of calls (zero for a parked issue), `--bare` present iff api mode, allowed tools per mode,
 no GH_TOKEN, prompt content contains the diff/ledger, etc.
 
@@ -110,12 +127,18 @@ no GH_TOKEN, prompt content contains the diff/ledger, etc.
 
 ## conftest fixtures (names are the contract; see conftest.py for details)
 - `fake_dir` -> Path of FACTORY_FAKE_DIR (fresh per test), with helper methods on a small `Fakes` object:
-  `queue(*outputs_or_dicts)`, `calls()` -> list[dict], `gh_calls()`, `gh_state()` / `set_gh_state(dict)`, `pr(number)`.
+  `queue(*outputs_or_dicts)`, `queue_remaining()` -> the entries no fake popped, `calls()` -> list[dict],
+  `gh_calls()`, `gh_state()` / `set_gh_state(dict)`, `pr(number)`, `issue(number)`,
+  `fail_next(*prefixes)` (arms `gh_state["fail_next"]`).
 - `origin` -> Path of a bare git repo.
 - `target` -> Path of a clone of `origin` on `main` seeded with: `checks.py` (exits 1 if a file named `RED` exists, else 0),
   `factory.toml` with `checks = [["python3","checks.py"]]`, `test_paths=["tests/"]`, `harness="claude"`, `auth="subscription"`,
   `stage_timeout_min=1`; `Makefile` (unused but present), `AGENTS.md`, `CLAUDE.md`, `REVIEW.md`, `.gitignore` with `.factory/`,
   `src/app.py`, `tests/test_app.py`; committed and pushed to origin. The fixture also registers issue 42 in `gh_state.json`.
+- A test that needs `poll` to skip its own `doctor` preflight (design §12 step 0) seeds
+  `.factory/doctor.json` with `{"<harness>:<auth>": {"ok": true, "factory_version": <factory.__version__>,
+  "cli_version": <the fake's --version line>, "at": "…", "checks": []}}`; otherwise the preflight runs `doctor`,
+  which consumes queue entries of its own.
 - `run_cli(*args, env=None) -> (exit_code, stdout, stderr)` runs `factory.cli.main` in-process with cwd = target
   (monkeypatch chdir) and captured streams. Prefer this over subprocess for speed; one smoke test runs the console script for real.
 - `worktree(issue=42)` -> Path `target/.factory/worktrees/42`.

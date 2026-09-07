@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# factory-host <repo> <factory args...>  — design §13.
+#
+# The single place the docker invocation lives: the systemd timer and the operator over SSH both go
+# through it, so there is exactly one description of how the factory container is started.
+#
+#   /etc/factory/<repo>.env    FACTORY_IMAGE, GH_TOKEN, the selected provider key (mode 600)
+#   /srv/factory/<repo>        bind-mounted at /work; /srv/factory/<repo>/repo is the clone
+#
+# Install as /usr/local/bin/factory-host (mode 0755). See deploy/README.md.
+set -euo pipefail
+
+prog=${0##*/}
+env_dir=${FACTORY_ENV_DIR:-/etc/factory}
+state_dir=${FACTORY_STATE_DIR:-/srv/factory}
+
+die() {
+    printf '%s: %s\n' "$prog" "$1" >&2
+    exit "${2:-1}"
+}
+
+if [ $# -lt 2 ]; then
+    printf 'usage: %s <repo> <factory args...>\n' "$prog" >&2
+    printf '  e.g. %s my-service poll\n       %s my-service status 42\n' "$prog" "$prog" >&2
+    exit 2
+fi
+
+repo=$1
+shift
+case $repo in
+    *[/[:space:]]* | '' | .* | -*) die "invalid repo name '$repo'" 2 ;;
+esac
+
+env_file="$env_dir/$repo.env"
+repo_dir="$state_dir/$repo"
+[ -r "$env_file" ] || die "cannot read $env_file (create it, mode 600)"
+[ -d "$repo_dir/repo" ] || die "$repo_dir/repo is not a directory (clone the target repo there)"
+
+# The unit's EnvironmentFile already exports FACTORY_IMAGE; for an interactive operator it is read
+# out of the env file. The file is never sourced: it is a docker --env-file (unquoted VAR=value),
+# not a shell script, and its secrets have no business in this process's environment.
+image=${FACTORY_IMAGE:-}
+if [ -z "$image" ]; then
+    image=$(sed -n 's/^[[:space:]]*FACTORY_IMAGE[[:space:]]*=[[:space:]]*//p' "$env_file" | tail -n 1)
+    image=${image%\"}
+    image=${image#\"}
+fi
+[ -n "$image" ] || die "FACTORY_IMAGE is not set in $env_file"
+
+user=${FACTORY_USER:-factory}
+uid=${FACTORY_UID:-$(id -u "$user")}
+gid=${FACTORY_GID:-$(id -g "$user")}
+
+# -it only when there is a terminal on both ends: under the timer there is neither.
+tty_args=()
+if [ -t 0 ] && [ -t 1 ]; then
+    tty_args=(-it)
+fi
+
+exec docker run --rm --init \
+    ${tty_args[@]+"${tty_args[@]}"} \
+    --user "$uid:$gid" \
+    --env-file "$env_file" \
+    -v "$repo_dir:/work" \
+    -w /work/repo \
+    "$image" \
+    factory "$@"

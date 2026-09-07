@@ -1,0 +1,39 @@
+# Build and push the factory image on every v* git tag (design §13). The tag is the pin: a target
+# repo's .devcontainer/Dockerfile says FROM ghcr.io/<owner>/factory:<tag>.
+name: image
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image name
+        id: image
+        run: echo "repo=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/factory" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.image.outputs.repo }}:${{ github.ref_name }}
+            ${{ steps.image.outputs.repo }}:latest

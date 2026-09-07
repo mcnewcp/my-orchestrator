@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Fake `claude` CLI for the factory test suite. Contract: tests/FAKES.md.
+
+Every behaviour comes from files in the fake directory; nothing here talks to a network. The
+directory is located as ``<dirname(argv[0])>/../.fake_dir`` first and ``$FACTORY_FAKE_DIR`` second,
+because the factory's allowlisted harness environment (design §8) deliberately drops
+``FACTORY_FAKE_DIR`` — once a real stage launches us the pointer file one level above this script
+(conftest copies us into ``<fake dir>/bin``) is the only route, and the variable's absence from
+``env_keys`` is itself under test.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+BINARY = "claude"
+VERSION_LINE = "9.9.9 (Claude Code)"
+QUEUE_FILE = "harness_queue.jsonl"
+CALLS_FILE = "harness_calls.jsonl"
+POINTER_NAME = ".fake_dir"
+RECORDED_ENV = ("ANTHROPIC_API_KEY", "CODEX_API_KEY", "GH_TOKEN", "FACTORY_FAKE_DIR", "CLAUDECODE")
+PROMPT_RE = re.compile(r"Follow the instructions in (.+?) exactly\.")
+NOT_LOGGED_IN = "Not logged in · Please run /login"
+DEFAULT_MODEL_USAGE = {"claude-fake-1": {}}
+
+
+class FakeExit(Exception):
+    """Print `message` on stderr and exit with `code`."""
+
+    def __init__(self, message: str, code: int):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+# ---------------------------------------------------------------- fake directory
+
+
+def script_dirs() -> list[Path]:
+    """dirname(argv[0]) first, then dirname(__file__) — identical under a shebang, but argv[0] is
+    what the contract names and __file__ is what survives an odd exec."""
+    dirs: list[Path] = []
+    for raw in (sys.argv[0] if sys.argv else "", __file__):
+        if not raw:
+            continue
+        try:
+            parent = Path(raw).resolve().parent
+        except OSError:
+            continue
+        if parent not in dirs:
+            dirs.append(parent)
+    return dirs
+
+
+def fake_dir() -> Path:
+    for directory in script_dirs():
+        pointer = directory.parent / POINTER_NAME
+        try:
+            target = pointer.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if target:
+            return Path(target)
+    from_env = os.environ.get("FACTORY_FAKE_DIR", "").strip()
+    if from_env:
+        return Path(from_env)
+    searched = ", ".join(str(d.parent / POINTER_NAME) for d in script_dirs())
+    raise FakeExit(f"fake {BINARY}: no fake dir; looked for {searched} and $FACTORY_FAKE_DIR", 3)
+
+
+def atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_lines(path: Path) -> list[str]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [line for line in raw.splitlines() if line.strip()]
+
+
+def pop_queue(directory: Path) -> dict:
+    path = directory / QUEUE_FILE
+    lines = read_lines(path)
+    if not lines:
+        raise FakeExit("fake harness: queue empty", 3)
+    try:
+        entry = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        raise FakeExit(f"fake harness: first queue entry in {path} is not JSON: {exc}", 3) from exc
+    if not isinstance(entry, dict):
+        raise FakeExit(f"fake harness: first queue entry in {path} is not a JSON object", 3)
+    atomic_write(path, "".join(f"{line}\n" for line in lines[1:]))
+    return entry
+
+
+def record_call(directory: Path, record: dict) -> int:
+    """Append one line to harness_calls.jsonl; returns this invocation's zero-based index."""
+    path = directory / CALLS_FILE
+    index = len(read_lines(path))
+    directory.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+    return index
+
+
+def apply_writes(entry: dict, root: Path) -> None:
+    for rel, content in (entry.get("writes") or {}).items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    for rel in entry.get("deletes") or []:
+        try:
+            (root / rel).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def stall(entry: dict) -> None:
+    """sleep_s (timeout tests) then hang (interrupted-stage tests kill the process group)."""
+    seconds = float(entry.get("sleep_s") or 0)
+    if seconds > 0:
+        time.sleep(seconds)
+    while entry.get("hang"):
+        time.sleep(3600)
+
+
+# ---------------------------------------------------------------- argv
+
+
+def flag_value(argv: list[str], *names: str) -> str | None:
+    for index, arg in enumerate(argv):
+        if arg in names:
+            return argv[index + 1] if index + 1 < len(argv) else None
+        for name in names:
+            if arg.startswith(f"{name}="):
+                return arg.split("=", 1)[1]
+    return None
+
+
+def prompt_argument(argv: list[str]) -> str | None:
+    """The prompt sentence is the first positional after -p (design §8, verified 2026-09-06)."""
+    for index, arg in enumerate(argv):
+        if arg in ("-p", "--print"):
+            following = argv[index + 1] if index + 1 < len(argv) else None
+            if following is not None and not following.startswith("-"):
+                return following
+            return None
+    return None
+
+
+def prompt_file_of(sentence: str | None) -> str | None:
+    if not sentence:
+        return None
+    match = PROMPT_RE.search(sentence)
+    return match.group(1) if match else None
+
+
+def read_prompt(root: Path, prompt_file: str | None) -> str | None:
+    if not prompt_file:
+        return None
+    path = Path(prompt_file)
+    if not path.is_absolute():
+        path = root / path
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def parse_schema(raw: str | None):
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+
+def call_record(argv: list[str], root: Path, schema) -> dict:
+    sentence = prompt_argument(argv)
+    prompt_file = prompt_file_of(sentence)
+    return {
+        "binary": BINARY,
+        "argv": argv,
+        "argv0": sys.argv[0],
+        "cwd": str(root),
+        "env_keys": sorted(os.environ),
+        "env": {name: ("present" if os.environ.get(name) else "absent") for name in RECORDED_ENV},
+        "prompt_sentence": sentence,
+        "prompt_file": prompt_file,
+        "prompt_text": read_prompt(root, prompt_file),
+        "schema": schema,
+    }
+
+
+# ---------------------------------------------------------------- result
+
+
+def result_payload(entry: dict, index: int) -> dict:
+    output = entry.get("output")
+    is_error = bool(entry.get("is_error"))
+    if "result" in entry:
+        text = entry["result"]
+    elif output is not None:
+        text = json.dumps(output)
+    else:
+        text = "fake harness error" if is_error else ""
+    payload = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": is_error,
+        "num_turns": int(entry.get("num_turns", 3)),
+        "session_id": f"fake-{index}",
+        "result": text,
+        "modelUsage": entry.get("model_usage", DEFAULT_MODEL_USAGE),
+        "permission_denials": entry.get("permission_denials", []),
+    }
+    if output is not None:
+        payload["structured_output"] = output
+    return payload
+
+
+def not_logged_in(index: int) -> dict:
+    """The real 2026-09-06 shape: exit 1, is_error true, subtype "success" (see the smoke doc)."""
+    return {
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "num_turns": 1,
+        "session_id": f"fake-{index}",
+        "result": NOT_LOGGED_IN,
+        "modelUsage": {},
+        "permission_denials": [],
+    }
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if "--version" in argv:
+        print(VERSION_LINE)
+        return 0
+    directory = fake_dir()
+    root = Path.cwd()
+    schema = parse_schema(flag_value(argv, "--json-schema"))
+    index = record_call(directory, call_record(argv, root, schema))
+    if "--bare" in argv and not os.environ.get("ANTHROPIC_API_KEY"):
+        print(json.dumps(not_logged_in(index)))
+        return 1
+    entry = pop_queue(directory)
+    apply_writes(entry, root)
+    stall(entry)
+    print(json.dumps(result_payload(entry, index)))
+    return int(entry.get("exit_code", 0))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except FakeExit as exit_:
+        sys.stderr.write(f"{exit_.message}\n")
+        raise SystemExit(exit_.code) from None
