@@ -114,7 +114,10 @@ def resume(run_id: str):
 
 @app.command()
 @guarded
-def status(run_id: str | None = None, as_json: Annotated[bool, typer.Option("--json")] = False):
+def status(
+    run_id: Annotated[str | None, typer.Argument()] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+):
     """Show durable state, artifact locations, attempts, and GitHub PR identity."""
     cfg, state = load_config(), _state()
     runs = [state.get(run_id)] if run_id else state.list_runs()

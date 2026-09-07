@@ -8,6 +8,6 @@ __pycache__/
 dist/
 *.egg-info/
 .env
-factory.toml
+/factory.toml
 .coverage
 .auth/
