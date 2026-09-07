@@ -61,6 +61,30 @@ def test_every_role_placeholder_is_a_known_placeholder():
             )
 
 
+# ---------------------------------------------------------------- harness-neutral wording
+
+
+@pytest.mark.parametrize("stage", ["spec", "plan", "review"])
+def test_the_read_only_roles_do_not_assume_a_file_reading_tool(stage):
+    """Design §8: the same role text drives both harnesses. "Do not run shell commands" is right for
+    Claude Code in read mode (allowedTools Read,Grep,Glob) and wrong for Codex, whose `--sandbox
+    read-only` gives it no reader but the shell — which is how a live review returned an empty ledger
+    it had never read the diff for (deviation 69)."""
+    text = prompts.load_role(stage)
+
+    assert "Do not run shell commands" not in text
+    assert "do not run anything that writes" in text
+    assert "read-only shell commands such as" in text
+
+
+def test_the_review_role_says_when_to_report_an_incomplete_review():
+    """The `complete` flag is only useful if the reviewer is told what it means (deviation 70)."""
+    text = prompts.load_role("review")
+
+    assert "Set `complete` true only when you read the whole diff" in text
+    assert "empty findings are not approval" in text
+
+
 # ---------------------------------------------------------------- render
 
 
@@ -266,13 +290,17 @@ def test_ledger_and_findings_survive_rendering_into_the_review_role():
 
 
 def test_describe_diff_names_path_bytes_lines_and_the_read_instruction():
+    """The instruction must fit either harness (deviation 69): this text sits in the same prompt as the
+    review role and is the sentence nearest the diff's path, so a file-tool-only phrasing here would
+    re-create the dogfood bug the role wording fixed."""
     text = prompts.describe_diff(".factory/tmp/review-1.diff", 12_345, 678, False, [])
 
     assert ".factory/tmp/review-1.diff" in text
     assert "12345 bytes" in text
     assert "678 lines" in text
-    assert "offset/limit" in text
     assert "line 678" in text
+    assert "offset/limit" in text  # for a harness whose reader is a file tool
+    assert "sed -n" in text  # for one whose only reader is a read-only shell
     assert "TRUNCATED" not in text
 
 

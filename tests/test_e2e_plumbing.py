@@ -101,6 +101,7 @@ BUILD_ENTRY = {
 
 CLEAN_REVIEW = {
     "summary": "The diff adds one pure function covered by the acceptance criterion. Fit to merge.",
+    "complete": True,
     "updates": [],
     "new": [],
 }

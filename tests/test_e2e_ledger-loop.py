@@ -142,6 +142,7 @@ def review_entry(
 ) -> dict:
     return {
         "summary": summary,
+        "complete": True,
         "updates": [dict(u) for u in updates],
         "new": [dict(n) for n in new],
     }

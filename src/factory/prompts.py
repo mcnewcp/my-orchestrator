@@ -11,7 +11,8 @@ Placeholder producers (stages.py):
   plan           plan.md text                                    (build, review)
   diff           NOT the diff text: a sentence giving the worktree-relative path of the diff file written by
                  stages.write_review_diff (".factory/tmp/review-<n>.diff"), its byte and line counts, whether it was
-                 truncated, and the instruction to read it completely with offset/limit  (review)
+                 truncated, and the instruction to read it completely, spelled for either harness — offset/limit for a
+                 file-reading tool, `cat`/`sed -n` slices for a read-only shell  (review)
   checks         checks.tail(latest check log, 200)             (build, fix, review)
   review_policy  REVIEW.md from the worktree or load_template("REVIEW.md"), plus the factory-appended line
                  "Nit cap enforced by the factory this round: N. Exceeding it fails the round."  (review)
@@ -145,9 +146,10 @@ def describe_diff(
     parts = [
         f"The diff under review is not reproduced here. It is the file `{path_rel}`, relative to the root "
         f"of this worktree: {nbytes} bytes, {nlines} lines.",
-        f"Read it completely before you judge anything: start at the beginning and keep reading with "
-        f"offset/limit until you have seen line {nlines}. A single read may return only the first part of "
-        f"the file. Do not review from a partial read.",
+        f"Read it completely before you judge anything: start at the beginning and keep going until you "
+        f"have seen line {nlines} — with a file-reading tool, continue with offset/limit; with a shell, "
+        f"`cat` the file, or walk it in slices with `sed -n '1,400p'`, `sed -n '401,800p'` and so on. A "
+        f"single read may return only the first part of the file. Do not review from a partial read.",
     ]
     if truncated:
         banner = (

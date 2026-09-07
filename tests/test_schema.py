@@ -38,6 +38,7 @@ SAMPLES: dict[str, dict] = {
     },
     "review": {
         "summary": "The diff adds a counter and a test. Bugs: one important finding. Security: none.",
+        "complete": True,
         "updates": [
             {"id": "F1", "status": "resolved", "evidence": "src/importer.py:41 now guards None"}
         ],
@@ -116,6 +117,18 @@ def test_missing_key_is_reported_by_name():
     broken = _review()
     del broken["updates"]
     assert validate(broken, load_schema("review")) == ["$: missing required key 'updates'"]
+
+
+def test_complete_is_required_and_must_be_boolean():
+    """The reviewer must state whether it actually reviewed: Python, not prose, owns the verdict,
+    and `stages.review` gates on `complete` (deviations 69-70)."""
+    broken = _review()
+    del broken["complete"]
+    assert validate(broken, load_schema("review")) == ["$: missing required key 'complete'"]
+    assert validate(_review(complete="true"), load_schema("review")) == [
+        "$.complete: expected boolean, got string"
+    ]
+    assert validate(_review(complete=False), load_schema("review")) == []
 
 
 def test_missing_nested_key_is_reported_with_its_path():

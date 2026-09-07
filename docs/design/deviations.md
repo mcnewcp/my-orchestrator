@@ -292,3 +292,41 @@ the docstring of the function that carries it.
 68. **`tests/test_cli.py`** updates `abandon`'s prepare policy and takes the lock the way `prepare` does in the
     lock-clearing test, and adds tests that a lock this process does not own is never cleared and that a
     `KeyboardInterrupt` leaves the lock in place and prints the new message.
+
+## Round-3 decisions (dogfood, 2026-09-07)
+
+The first live Codex run (fixture issue #6, PR #11) finalized a PR marked ready over a diff nobody had read.
+The review returned `{"summary": "Review is blocked because the instructions prohibit shell commands and no
+non-shell local file reader is available to read `.factory/tmp/review-1.diff`. … Empty findings do not
+indicate approval.", "updates": [], "new": []}` — and an empty ledger is what a clean review looks like, so
+the loop ran on to `finalize`. Two causes, one per item.
+
+69. **The read-only roles are harness-neutral about HOW to read** (§8: "the same files drive either harness").
+    All three read-only roles said "Do not run shell commands"; `roles/review.md` went on, "Read files with
+    your file-reading tool only." (`roles/spec.md` and `roles/plan.md` said instead "Read and search the
+    repository as much as you need; the factory writes every file.") That is right for Claude Code in read
+    mode (`--allowedTools Read,Grep,Glob`, `Bash` disallowed) and impossible for Codex, whose `--sandbox
+    read-only` gives it no reader but the shell: read-only shell commands are exactly what that sandbox
+    exists to allow. All three now forbid the WRITING (no file creation or edit, nothing that runs tests,
+    installs, formatters or a state-changing `git`) and leave the reading to whatever the harness has — "a
+    file-reading/search tool if you have one, otherwise read-only shell commands such as `cat`, `sed -n`,
+    `grep`, `git diff`, `git log`". The review role keeps its "read the diff file completely" instruction,
+    now spelled for both: offset/limit for a file tool, `cat` or `sed -n '1,400p'` slices for a shell — and
+    so does `prompts.describe_diff`, the `{diff}` block that names the diff's path in the same prompt and
+    used to give the offset/limit instruction alone. `tests/test_prompts.py` guards both in both directions.
+70. **"Empty findings do not indicate approval" is enforced, not trusted** (design rule: Python owns every
+    verdict). `schemas/review.json` gains a required boolean `complete` (§10 spells the schema without it) —
+    true only when the reviewer read the entire diff and ran all three passes, false with the reason in
+    `summary` — and `stages.review` gates on it after schema validation and BEFORE the ledger merge:
+    `out.get("complete") is not True` (`.get`, like every other stage's read of validated output, so a missing
+    key cannot raise a `KeyError` past the reset) is `_gate_failure("review <round> was not completed:
+    <summary>")`, so the worktree resets and the round leaves no ledger merge, no `review-<n>.json`, no
+    `ReviewRecord`, no commit and no PR comment, and the message reaches the next attempt's stage note through
+    the last-error channel (deviation 56) like any other gate.
+    The reviewer's prose can now only ever REJECT its own round; approval remains a Python conclusion drawn
+    from the ledger. The schema cannot also demand a non-empty `summary` (strict structured output has no
+    `minLength`), so a blank one becomes "the reviewer gave no reason" rather than a message that stops at
+    the colon. Every fake review output in `tests/` carries `"complete": true`; `test_e2e_gates.py` adds a
+    seventh proof (a `complete: false` round in the dogfood shape — every open finding updated, no new
+    finding, so no other gate would stop it — records nothing, then the same command succeeds carrying the
+    rejection) and `test_schema.py` a required/boolean check.

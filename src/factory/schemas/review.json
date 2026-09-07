@@ -5,7 +5,11 @@
   "properties": {
     "summary": {
       "type": "string",
-      "description": "Two to five sentences: what the diff does, what each pass (bugs, security, compliance) found, and whether the change is fit to merge."
+      "description": "Two to five sentences: what the diff does, what each pass (bugs, security, compliance) found, and whether the change is fit to merge. When `complete` is false, this is where you say what stopped you."
+    },
+    "complete": {
+      "type": "boolean",
+      "description": "true only when you read the entire diff and ran all three passes (bugs, security, compliance). false when anything prevented that — the diff file could not be read, a tool you needed was unavailable, you never reached the end of the file — with the reason in `summary`. false rejects the round: the factory records nothing, because empty findings are not approval."
     },
     "updates": {
       "type": "array",
@@ -73,5 +77,5 @@
       }
     }
   },
-  "required": ["summary", "updates", "new"]
+  "required": ["summary", "complete", "updates", "new"]
 }

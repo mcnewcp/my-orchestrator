@@ -10,10 +10,11 @@ factory actually leaves behind:
 * the fakes' journals — `harness_calls.jsonl` (was a model launched at all, with which flags and
   which prompt) and `gh_state.json` (PR draft/ready, comments and their idempotency markers).
 
-The six proofs, in order: red checks cannot push · a protected-path edit fails `build` · a
+The seven proofs, in order: red checks cannot push · a protected-path edit fails `build` · a
 test-file edit fails `fix` · `fix` refuses when code moved since the reviewed sha and `run` picks
 review instead · `finalize` refuses with open Important findings · a red baseline parks with one
-gate comment and re-parks silently.
+gate comment and re-parks silently · a review that reports it could not be completed records
+nothing.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from factory.gh import GATE_MARKER, SUMMARY_MARKER
+from factory.gh import GATE_MARKER, REVIEW_MARKER, SUMMARY_MARKER
 
 ISSUE = 42
 BRANCH = f"factory/{ISSUE}"
@@ -92,9 +93,16 @@ def important_finding(
     }
 
 
-def review_output(*, new: tuple[dict, ...] = (), updates: tuple[dict, ...] = ()) -> dict:
+def review_output(
+    *,
+    new: tuple[dict, ...] = (),
+    updates: tuple[dict, ...] = (),
+    complete: bool = True,
+    summary: str = "Read the diff; one pass per REVIEW.md section.",
+) -> dict:
     return {
-        "summary": "Read the diff; one pass per REVIEW.md section.",
+        "summary": summary,
+        "complete": complete,
         "updates": list(updates),
         "new": list(new),
     }
@@ -238,6 +246,11 @@ def assert_env_is_the_allowlist(call: dict) -> None:
     assert call["env"]["FACTORY_FAKE_DIR"] == "absent"
     assert call["env"]["ANTHROPIC_API_KEY"] == "absent"  # subscription mode inherits no key
     assert not [key for key in call["env_keys"] if key.startswith(("GH_", "GITHUB_"))]
+
+
+def pr_comment_calls(drive: Drive) -> int:
+    """How many `gh pr comment` calls the fake has recorded so far."""
+    return len([call for call in drive.fakes.gh_calls() if call["argv"][:2] == ["pr", "comment"]])
 
 
 def reach_review(drive: Drive) -> str:
@@ -398,7 +411,7 @@ def test_fix_refuses_when_code_changed_since_the_reviewed_sha(drive: Drive):
     assert flag_values(review_call["argv"], "--disallowedTools") == [
         "Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch"
     ]
-    assert review_call["schema"]["required"] == ["summary", "updates", "new"]
+    assert review_call["schema"]["required"] == ["summary", "complete", "updates", "new"]
     assert ".factory/tmp/review-2.diff" in review_call["prompt_text"]
     assert "F1 [open · important · bugs]" in review_call["prompt_text"]
     assert "**NEEDS UPDATE**" in review_call["prompt_text"]
@@ -488,3 +501,55 @@ def test_a_red_baseline_parks_once_and_stays_parked(drive: Drive):
     assert len(drive.comments) == comments_before
     assert len(drive.comments_matching(gate_marker)) == 1
     assert drive.dirty == []
+
+
+# ---------------------------------------------------------------- proof 7
+
+
+BLOCKED = (
+    "Review is blocked: no reader for .factory/tmp/review-2.diff, so no pass ran. "
+    "Empty findings do not indicate approval."
+)
+
+
+def test_an_incomplete_review_records_nothing_and_says_so_next_time(drive: Drive):
+    """Python owns the verdict (deviation 70): a reviewer that says it could not read the diff or run
+    every pass fails the round. Nothing is merged, written, committed or commented, and the next attempt
+    is told why the last one was thrown away. The round is the dogfood shape — every open finding
+    updated, no new finding — so it is one every OTHER gate would wave through: without the `complete`
+    gate this exact output finalizes a review nobody performed."""
+    reach_review(drive)
+    before = drive.head
+    ledger_before = drive.read(f"{WORK}/findings.json")
+    calls_before = len(drive.calls)
+    comment_calls_before = pr_comment_calls(drive)
+
+    code, _out, err = drive.review(complete=False, summary=BLOCKED, updates=(resolved("F1"),))
+
+    assert code == 1
+    assert f"review 2 was not completed: {BLOCKED}" in err
+    assert f"re-run `factory review {ISSUE}`" in err  # the hint names the way out
+    assert len(drive.calls) == calls_before + 1, "the session ran; only its verdict was refused"
+
+    # nothing the round produced survives: no ledger merge, no artifact, no record, no commit, no push
+    assert drive.read(f"{WORK}/findings.json") == ledger_before
+    assert [f["id"] for f in drive.findings if f["status"] == "open"] == ["F1"]
+    assert not (drive.wt / f"{WORK}/review-2.json").exists()
+    assert len(drive.state["reviews"]) == 1
+    assert drive.head == before
+    assert drive.origin_head() == before
+    assert drive.dirty == []
+    assert pr_comment_calls(drive) == comment_calls_before
+    assert not drive.comments_matching(REVIEW_MARKER.format(round=2, sha=before))
+
+    # the same command, a reviewer that finished this time: it succeeds, carrying the rejection
+    code, _out, err = drive.review(updates=(resolved("F1"),))
+
+    assert code == 0, err
+    prompt = drive.last_call["prompt_text"]
+    assert drive.last_call["prompt_file"] == f"{WORK}/prompts/review-2.md"
+    assert "The previous attempt was discarded because" in prompt
+    assert "review 2 was not completed" in prompt
+    assert len(drive.state["reviews"]) == 2
+    assert [f["status"] for f in drive.findings] == ["resolved"]
+    assert drive.comments_matching(REVIEW_MARKER.format(round=2, sha=before))

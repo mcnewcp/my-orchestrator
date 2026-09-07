@@ -1258,7 +1258,9 @@ def review(ctx: Context) -> None:
     reviewed = HEAD. Inputs: spec, plan, diff (describe_diff over write_review_diff), checks (tail of latest_check_log,
     200 lines), review_policy (worktree REVIEW.md or load_template("REVIEW.md"), plus the enforced nit-cap line),
     ledger (format_ledger_for_review), stage_note (round). mode read; schema "review".
-    Gates (reset + GateViolation, nothing saved): (copy, stats) = ledger.merged_copy(out, round);
+    Gates (reset + GateViolation, nothing saved): out.get("complete") is not True -> "review <round> was not completed:
+      <summary, or "the reviewer gave no reason" when it is blank>" (Python owns the verdict: an empty ledger from a
+      reviewer that could not read the diff is not a clean review); then (copy, stats) = ledger.merged_copy(out, round);
       stats.missing_updates non-empty -> "reviewer did not update F3, F5"; stats.new_nits > config.max_nits -> "nit cap".
     Accept: ctx.ledger = copy; work/<n>/review-<round>.json = out; reviews.append(ReviewRecord(round, sha=reviewed,
     important_open=len(copy.open_important()), important_resolved=stats.resolved, nits=stats.new_nits,
@@ -1299,6 +1301,18 @@ def review(ctx: Context) -> None:
     )
 
     with _after_the_session(ctx):
+        # The reviewer's own account of whether it could review at all, checked before anything is merged: a
+        # reviewer that never read the diff returns an empty ledger, which would otherwise read as "clean".
+        if out.get("complete") is not True:
+            # The schema cannot demand a non-empty summary (strict structured output has no minLength), and the
+            # gate exists to carry a reason, so an empty one gets a factory-authored stand-in.
+            why = str(out.get("summary") or "").strip() or "the reviewer gave no reason"
+            _gate_failure(
+                ctx,
+                f"review {round} was not completed: {why}",
+                hint="the reviewer could not read the diff or run every pass; fix the cause (see the "
+                f"transcript) and re-run `factory review {ctx.issue}`",
+            )
         # merged_copy validates the reviewer's own entries: a finding with no title or an unknown severity is a
         # FactoryError, and it must reset the worktree like any other rejected round (the read stage wrote the
         # diff into .factory/tmp, which the reset keeps).

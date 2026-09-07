@@ -1015,6 +1015,7 @@ def test_a_review_the_ledger_merge_rejects_resets_and_keeps_the_ledger(workspace
     harness = StubHarness(
         {
             "summary": "one finding",
+            "complete": True,
             "updates": [],
             "new": [
                 {
@@ -1043,6 +1044,25 @@ def test_a_review_the_ledger_merge_rejects_resets_and_keeps_the_ledger(workspace
     assert (
         ctx.worktree / ".factory" / "tmp" / "review-1.diff"
     ).exists()  # .factory/ survives a reset
+
+
+def test_an_incomplete_review_with_no_summary_still_says_why_the_round_died(workspace):
+    """The gate exists to carry the reason into stderr and the next attempt's stage note, and the schema
+    cannot demand a non-empty `summary` (strict structured output has no minLength). A reviewer that sets
+    `complete` false and leaves `summary` blank must not produce a message that stops at the colon."""
+    ctx = make_context(workspace)
+    ready_for_review(ctx)
+    ctx.harness = StubHarness({"summary": "  ", "complete": False, "updates": [], "new": []})
+    ctx.harness_env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"]}
+    RunLock.create(ISSUE, "", ctx.worktree).write(ctx.repo.factory_dir)
+
+    with pytest.raises(GateViolation) as exc:
+        stages.review(ctx)
+
+    assert exc.value.message == "review 1 was not completed: the reviewer gave no reason"
+    assert state_module.read_last_error(ctx.repo.factory_dir, ISSUE) == exc.value.message
+    assert ctx.state.reviews == []
+    assert ctx.repo.is_clean(ctx.worktree)
 
 
 # ---------------------------------------------------------------- the checks run on a pristine tree
