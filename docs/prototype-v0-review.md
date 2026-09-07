@@ -40,4 +40,5 @@ GitHub CLI supports the required `pr ready --undo` command. No additional
 confirmed material specification defects or scope creep were found.
 
 Standards: 0 hard violations, 3 maintenance heuristics. Specification: 2 material
-findings, both repaired. See the validation record for separate live trial evidence.
+findings, both repaired. See the [validation record](prototype-v0-validation.md)
+for separate live trial evidence.

@@ -31,15 +31,20 @@ by `docker image inspect software-factory:v0-prototype --format '{{.Id}}'` as
 Workspace and authentication directories must be writable by the image's
 `factory` user (default UID/GID `1000:1000`).
 
-Clone the target using its HTTPS URL into `<workspace>/target`. Review
+Clone the target using its HTTPS URL and check out the configured base branch
+in `<workspace>/target`. Review
 `factory.toml`: repository, base branch, host workspace path, non-mutating local
 checks, exact required CI job names, and protected verification files. Review and
 commit the target's `AGENTS.md`, `CLAUDE.md`, and `REVIEW.md`; starters are in
-[examples/target](examples/target). Install its build/test dependencies in the
-Dockerfile before building the image.
+[examples/target](examples/target). Publish those files, check scripts, and CI
+definitions to the remote base branch through the repository's normal review
+process before preparation: the worker starts from `origin/<base_branch>`.
+Install its build/test dependencies in the Dockerfile before building the image.
 
 For the prepared `mcnewcp/orch-sandbox` trial, use base `prototype/v0-cdx`, required
 CI `factory-v0-tests`, and local check `['sh', 'scripts/check-factory-v0.sh']`.
+Clone that prepared branch with
+`git clone --branch prototype/v0-cdx https://github.com/mcnewcp/orch-sandbox.git <workspace>/target`.
 
 Start Postgres, migrate, and log in through the native tools. Choose the
 subscription account in each agent's login flow. Codex's device login is designed
@@ -104,6 +109,10 @@ bash scripts/check-codex-sandbox software-factory:v0-prototype
 The offline sandbox probe needs the installed host profile and makes no model
 requests. Tests use real Git/Postgres with simulated agents and GitHub; native
 smokes and actual issue-to-PR trials provide separate evidence.
+
+See the [validation record](docs/prototype-v0-validation.md) for test results,
+live subscription trial PRs, recovery exercises, and remaining acceptance work.
+The [review record](docs/prototype-v0-review.md) covers the implementation review.
 
 Tagged `v*` releases run tests and publish an image to GHCR. The manual
 **Agent smoke** workflow accepts that digest, loads its matching source profiles,
