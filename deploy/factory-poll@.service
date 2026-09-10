@@ -1,0 +1,16 @@
+[Unit]
+Description=Software factory poll for %i
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/factory/%i.env
+
+[Service]
+Type=oneshot
+User=factory
+Group=factory
+SupplementaryGroups=docker
+UMask=0077
+EnvironmentFile=/etc/factory/%i.env
+ExecStart=/usr/local/bin/factory-host %i poll
+TimeoutStartSec=infinity

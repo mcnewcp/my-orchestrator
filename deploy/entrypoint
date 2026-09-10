@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+umask 077
+
+# The host wrapper provides a writable tmpfs, including when --user maps a UID
+# that differs from the image's factory account. No login directory is mounted.
+mkdir -p "$HOME"
+git config --global user.name "${FACTORY_GIT_NAME:-Software Factory}"
+git config --global user.email "${FACTORY_GIT_EMAIL:-factory@localhost}"
+if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; then
+    gh auth setup-git --hostname "${GH_HOST:-github.com}"
+fi
+
+exec "$@"

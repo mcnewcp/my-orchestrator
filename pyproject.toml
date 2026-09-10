@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "software-factory"
+version = "0.1.0"
+description = "A local, resumable issue-to-PR factory for Claude Code and Codex"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+factory = "factory.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+factory = ["roles/*.md", "schemas/*.json"]

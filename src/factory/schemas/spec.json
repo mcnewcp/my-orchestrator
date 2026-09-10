@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "markdown": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "open_questions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      }
+    }
+  },
+  "required": [
+    "markdown",
+    "open_questions"
+  ],
+  "additionalProperties": false
+}

@@ -1,2 +1,10 @@
 # local artifacts
+.factory/
 .scratch/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.ruff_cache/
