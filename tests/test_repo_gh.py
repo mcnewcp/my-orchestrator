@@ -114,9 +114,9 @@ class RepoTests(unittest.TestCase):
 
     def test_renames_check_both_paths_and_support_unusual_names(self):
         worktree = self.repo.worktree(7)
-        (worktree / "work/7").mkdir(parents=True)
-        self.repo.git("mv", "source.txt", "work/7/source.txt", cwd=worktree)
-        self.assertEqual(self.repo.changed_paths(worktree), ["source.txt", "work/7/source.txt"])
+        (worktree / "moved").mkdir(parents=True)
+        self.repo.git("mv", "source.txt", "moved/source.txt", cwd=worktree)
+        self.assertEqual(self.repo.changed_paths(worktree), ["source.txt", "moved/source.txt"])
         with self.assertRaisesRegex(RuntimeError, "source.txt"):
             self.repo.validate_clean(worktree, 7)
         self.repo.reset(worktree)
@@ -156,7 +156,7 @@ class RepoTests(unittest.TestCase):
         diff = self.repo.diff(worktree, base)
         self.assertIn("implementation", diff)
         self.assertNotIn("PLAN SECRET", diff)
-        self.assertNotIn("work/7", diff)
+        self.assertNotIn(".factory/", diff)
 
     def test_sync_fast_forwards_and_refuses_divergence(self):
         worktree = self.repo.worktree(7)
@@ -264,6 +264,13 @@ class GitHubTests(unittest.TestCase):
         self.assertEqual(api.bodies, [body])
         self.assertIn("--draft", api.calls[1])
         self.assertNotIn("--body", api.calls[1])
+
+    def test_pr_document_refresh_preserves_exact_markdown(self):
+        api = RecordingGitHub(["updated"])
+        body = "<details>\n<summary>Plan</summary>\n\nLiteral `code` and $(text)\n\n</details>\n"
+        api.update_pr(23, body)
+        self.assertEqual(api.calls[0][:3], ("pr", "edit", "23"))
+        self.assertEqual(api.bodies, [body])
 
     def test_comment_deduplicates_only_own_exact_marker(self):
         for author, expected_calls in [("operator", 2), ("somebody-else", 3)]:

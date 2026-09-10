@@ -83,6 +83,39 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(resumed.head(), head)
         self.assertEqual(resumed.state["outcome"], "done")
 
+    def test_failed_force_push_restores_previous_run_for_an_explicit_retry(self):
+        self.through_build()
+        head = self.engine.head()
+        original_state = load_json(self.engine.work / "state.json")
+        original_ledger = load_json(self.engine.work / "findings.json")
+        plan = self.engine.work / "plan.md"
+        plan.write_text(plan.read_text() + "\nOperator clarification.\n")
+        self.adapter.mutations["build"] = lambda cwd: (cwd / "src/value.py").write_text("VALUE = 2\n")
+        with patch.object(self.repo, "push", side_effect=RuntimeError("push unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "push unavailable"):
+                execute_issue(self.repo, self.github, self.config, 42, "build", force=True)
+        self.assertEqual(self.engine.head(), head)
+        self.assertEqual(self.remote_head(), head)
+        self.assertEqual(load_json(self.engine.work / "state.json"), original_state)
+        self.assertEqual(load_json(self.engine.work / "findings.json"), original_ledger)
+        self.assertIn("Operator clarification.", plan.read_text())
+        self.assertEqual(execute_issue(self.repo, self.github, self.config, 42, "build", force=True), 0)
+        self.assertEqual((self.engine.cwd / "src/value.py").read_text(), "VALUE = 2\n")
+        self.assertEqual(self.engine.head(), self.remote_head())
+
+    def test_failed_document_refresh_retries_without_rebuilding(self):
+        self.through_build()
+        head = self.engine.head()
+        plan = self.engine.work / "plan.md"
+        plan.write_text(plan.read_text() + "\nUpdated operator guidance.\n")
+        with patch.object(self.github, "update_pr", side_effect=RuntimeError("PR edit unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "PR edit unavailable"):
+                execute_issue(self.repo, self.github, self.config, 42, "build")
+        self.resume().run()
+        self.assertIn("Updated operator guidance.", self.github.pr_body)
+        self.assertEqual(self.adapter.calls.count("build"), 1)
+        self.assertEqual(self.engine.head(), head)
+
 
 if __name__ == "__main__":
     unittest.main()

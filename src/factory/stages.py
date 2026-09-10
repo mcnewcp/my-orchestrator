@@ -87,14 +87,21 @@ class Engine:
         self.repo.push(self.issue, force=self.force_push)
         self.force_push = False
         self.save()
+        body = f"Closes #{self.issue}\n\n" + self.render_documents()
+        body_digest = hashlib.sha256(body.encode()).hexdigest()
         # GitHub cannot open a PR until the branch contains a code diff.
         if "build" in self.state.get("stages", {}) and not self.state.get("pr"):
             pr = self.github.ensure_pr(
                 self.issue, self.state["branch"], self.state["base"]["branch"],
                 f"Factory #{self.issue}: {self.state['issue'].get('title', 'implementation')}",
-                f"Closes #{self.issue}\n\n" + self.render_documents(),
+                body,
             )
             self.state["pr"] = pr
+            self.save()
+        # Also refresh a PR recovered after an interrupted creation.
+        if self.state.get("pr") and self.state.get("pr_body_sha256") != body_digest:
+            self.github.update_pr(self.state["pr"]["number"], body)
+            self.state["pr_body_sha256"] = body_digest
             self.save()
 
     def clear_outcome(self):
@@ -221,7 +228,7 @@ class Engine:
                 result[name] = None
         return result
 
-    def snapshot_factory(self):
+    def snapshot_factory(self, *, exclude=()):
         # The harness owns its transcripts. Everything else in .factory is
         # factory-owned, including ignored files inside the issue worktree.
         roots = [path for path in self.repo.local_dir.iterdir()
@@ -233,6 +240,8 @@ class Engine:
             if root.is_dir() and not root.is_symlink():
                 paths.extend(root.rglob("*"))
             for path in paths:
+                if path in exclude:
+                    continue
                 if path.is_symlink():
                     result[path] = ("symlink", str(path.readlink()))
                 elif path.is_file():
@@ -276,13 +285,20 @@ class Engine:
         print(f"Issue #{self.issue}: {stage} checks", flush=True)
         record_safe_head(self.repo, self.issue, stage=f"{stage} checks")
         path = self.work / "checks" / f"{stage}-{number}.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        artifacts = self.snapshot_factory(exclude=(path,))
         head = self.head()
         try:
             passed = run_checks(self.cwd, self.options["checks"], path, self.timeout)
         finally:
+            changed_artifacts = self.snapshot_factory(exclude=(path,))
+            if artifacts != changed_artifacts:
+                self.restore_factory(artifacts, changed_artifacts)
             if self.head() != head:
                 self.repo.reset(self.cwd, head)
                 raise RuntimeError("checks changed Git HEAD; factory owns commits")
+            if artifacts != changed_artifacts:
+                raise RuntimeError("checks modified factory files")
         if not passed:
             print(f"Checks failed; output: {path}")
         return passed

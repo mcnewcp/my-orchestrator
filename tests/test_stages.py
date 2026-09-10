@@ -1,6 +1,9 @@
 """Stage integration tests with real local Git and fake harness/GitHub adapters."""
 
 import copy
+import contextlib
+import io
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -8,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from factory.cli import execute_issue
+from factory.cli import execute_issue, status
 from factory.config import DEFAULTS
 from factory.harness import HarnessResult
 from factory.repo import Repo
@@ -50,6 +53,9 @@ class FakeGitHub:
 
     def comment(self, number, body, key):
         self.comments.setdefault(key, (number, body))
+
+    def update_pr(self, number, body):
+        self.pr_body = body
 
     def ready(self, number):
         self.ready_calls.append(number)
@@ -179,8 +185,27 @@ class StageTests(unittest.TestCase):
         self.assertEqual(self.engine.state["outcome"], "done")
         self.assertEqual(self.engine.head(), self.remote_head())
         self.assertEqual(self.repo.changed_paths(self.engine.cwd), [])
+        self.assertEqual(self.engine.work, self.root / ".factory/issues/42")
+        for name in ("intent.md", "spec.md", "plan.md", "state.json", "findings.json",
+                     "prompts/spec-1.md", "prompts/plan-1.md", "prompts/build-1.md",
+                     "prompts/review-1.md", "checks/baseline-1.log", "checks/build-1.log",
+                     "checks/finalize-1.log", "review-1.json", "review-1.diff"):
+            self.assertTrue((self.engine.work / name).is_file(), name)
+        self.assertTrue((self.repo.local_dir / "transcripts/fake-transcript.json").is_file())
+        self.assertFalse((self.engine.cwd / "work").exists())
+        self.assertEqual(self.git("log", "--format=%s", "main..factory/42"), "factory(42): build")
+        self.assertEqual(self.git("diff", "--name-only", "main...factory/42"), "src/value.py")
+        self.assertEqual(self.git("ls-tree", "--name-only", "factory/42", "work", ".factory"), "")
         for stage in self.engine.state["stages"].values():
-            self.assertTrue(self.repo.resolve(self.engine.cwd, stage["commit"]))
+            self.assertRegex(stage["commit"], r"^[0-9a-f]{40}$")
+            self.assertEqual(self.repo.resolve(self.engine.cwd, stage["commit"]), stage["commit"])
+        final_body = self.github.comments[f"factory:finalize:{self.engine.head()}"][1]
+        for body in (self.github.pr_body, final_body):
+            self.assertIn("<summary>Specification</summary>", body)
+            self.assertIn("<summary>Plan</summary>", body)
+            self.assertIn((self.engine.work / "spec.md").read_text().strip(), body)
+            self.assertIn((self.engine.work / "plan.md").read_text().strip(), body)
+            self.assertEqual(body.count("<details>"), 2)
         self.assertEqual(self.repo.resolve(self.engine.cwd, self.engine.state["outcome_sha"]), self.engine.head())
         rebuilt = Engine(self.repo, self.github, self.config, 42).prepare()
         rebuilt.run()
@@ -199,9 +224,15 @@ class StageTests(unittest.TestCase):
         self.assertEqual(self.adapter.calls, ["spec"])
         self.assertEqual(self.engine.head(), head)
         self.assertEqual(len(self.github.comments), comment_count)
-        self.engine.accept()
-        self.engine.run()
-        self.assertEqual(self.engine.state["outcome"], "done")
+        self.assertEqual(self.github.pr_creates, 0)
+        spec = self.engine.work / "spec.md"
+        spec.write_text(spec.read_text() + "\nOperator answer: return one.\n")
+        self.assertEqual(execute_issue(self.repo, self.github, self.config, 42, "accept"), 0)
+        self.assertEqual(self.engine.head(), head)
+        resumed = Engine(self.repo, self.github, self.config, 42).prepare()
+        resumed.run()
+        self.assertEqual(resumed.state["outcome"], "done")
+        self.assertIn("Operator answer: return one.", (resumed.work / "prompts/plan-1.md").read_text())
         self.assertEqual(self.github.issue_reads, 1)
 
     def test_red_baseline_parks_without_running_build_or_pushing_candidate(self):
@@ -294,6 +325,10 @@ class StageTests(unittest.TestCase):
         self.assertEqual(self.engine.state["reviews"][-1]["important_resolved"], 1)
         self.assertEqual(self.engine.ledger["findings"][0]["status"], "resolved")
         self.assertEqual(self.engine.state["outcome"], "done")
+        self.assertEqual(self.git("log", "--format=%s", "--reverse", "main..factory/42").splitlines(),
+                         ["factory(42): build", "factory(42): fix 1 (claims await review)"])
+        self.assertTrue((self.engine.work / "fix-1.json").is_file())
+        self.assertTrue((self.engine.work / "checks/fix-1.log").is_file())
 
     def test_fix_claim_does_not_change_ledger_status(self):
         self.through_review(finding())
@@ -385,11 +420,12 @@ class StageTests(unittest.TestCase):
 
     def test_force_build_preserves_operator_plan_edits_and_rewrites_safely(self):
         self.through_build()
-        self.operator_edit_plan( "\nOperator clarification: keep the public interface.\n")
+        self.operator_edit_plan("\nOperator clarification: keep the public interface.\n")
         self.engine = Engine(self.repo, self.github, self.config, 42).prepare()
         self.engine.rewind("build")
         self.engine.build()
         self.assertIn("Operator clarification", (self.engine.work / "plan.md").read_text())
+        self.assertIn("Operator clarification", self.github.pr_body)
         self.assertEqual(self.adapter.calls.count("build"), 2)
         self.assertEqual(self.engine.head(), self.remote_head())
         self.assertEqual(self.repo.changed_paths(self.engine.cwd), [])
@@ -397,7 +433,7 @@ class StageTests(unittest.TestCase):
     def test_failed_force_build_restores_original_head_operator_plan_and_ledger(self):
         self.through_review(finding())
         self.engine.dismiss("F1", "Accepted prototype limitation.")
-        self.operator_edit_plan( "\nOperator clarification must survive a failed build.\n")
+        self.operator_edit_plan("\nOperator clarification must survive a failed build.\n")
         before, remote_before = self.engine.head(), self.remote_head()
         original_plan = (self.engine.work / "plan.md").read_text()
         original_ledger = load_json(self.engine.work / "findings.json")
@@ -449,14 +485,16 @@ class StageTests(unittest.TestCase):
 
     def test_interrupted_force_restores_last_safe_head_and_operator_edits(self):
         self.through_build()
-        self.operator_edit_plan( "\nOperator clarification survives process death.\n")
+        self.operator_edit_plan("\nOperator clarification survives process death.\n")
         self.engine = Engine(self.repo, self.github, self.config, 42).prepare()
         safe = self.engine.head()
         stopped = subprocess.Popen([sys.executable, "-c", "pass"])
         stopped.wait()
         marker = self.repo.local_dir / "run/42.json"
-        atomic_json(marker, {"stage": "build", "pid": stopped.pid, "last_safe_head": safe})
+        atomic_json(marker, {"stage": "build", "pid": stopped.pid, "last_safe_head": safe,
+                             "state": self.engine.state, "ledger": self.engine.ledger})
         self.engine.rewind("build")
+        self.engine.save()
         (self.engine.cwd / "src/value.py").write_text("VALUE = -1\n# interrupted forced candidate\n")
         self.assertNotEqual(self.engine.head(), safe)
         self.assertEqual(execute_issue(self.repo, self.github, self.config, 42), 0)
@@ -482,6 +520,142 @@ class StageTests(unittest.TestCase):
         self.assertEqual((self.engine.cwd / "src/value.py").read_text(), "VALUE = 1\n")
         self.assertEqual(self.github.pr_creates, 1)
         self.assertFalse(marker.exists())
+
+    def test_read_only_stages_never_commit(self):
+        base = self.engine.head()
+        with patch.object(self.repo, "commit", wraps=self.repo.commit) as commit:
+            self.through_plan()
+            commit.assert_not_called()
+        self.assertEqual(self.engine.head(), base)
+        self.assertEqual(self.github.pr_creates, 0)
+        self.engine.build()
+        head = self.engine.head()
+        with patch.object(self.repo, "commit", wraps=self.repo.commit) as commit:
+            self.engine.review()
+            self.engine.finalize()
+            commit.assert_not_called()
+        self.assertEqual(self.engine.head(), head)
+
+    def test_checks_cannot_rewrite_local_artifacts(self):
+        self.through_plan()
+        spec = self.engine.work / "spec.md"
+        original = spec.read_bytes()
+        self.config["factory"]["checks"] = [[sys.executable, "-c",
+            f"from pathlib import Path; Path({str(spec)!r}).write_text('Altered requirements')"]]
+        self.assert_candidate_not_published(self.engine.build, RuntimeError, "checks modified factory files")
+        self.assertEqual(spec.read_bytes(), original)
+        self.assertTrue((self.engine.work / "checks/baseline-1.log").is_file())
+        self.assertNotIn("build", self.adapter.calls)
+
+    def test_noop_fix_still_requires_another_review(self):
+        self.adapter.mutations["fix"] = lambda cwd: None
+        self.adapter.reviews = [review(finding()), review(updates=[update("F1", "unresolved")])]
+        with self.assertRaisesRegex(NeedsHuman, "no_progress"):
+            self.engine.run()
+        self.assertEqual(self.adapter.calls, ["spec", "plan", "build", "review", "fix", "review"])
+        self.assertEqual(self.git("log", "--format=%s", "main..factory/42"), "factory(42): build")
+        for number in (1, 2):
+            self.assertIn(f"factory:review:{self.engine.head()}:{number}", self.github.comments)
+
+    def test_build_and_fix_cannot_change_ignored_factory_files(self):
+        self.through_review(finding())
+        original = (self.engine.work / "state.json").read_bytes()
+        for stage in ("build", "fix"):
+            for local in (False, True):
+                with self.subTest(stage=stage, local=local):
+                    target = (self.engine.work / "state.json" if local
+                              else self.engine.cwd / ".factory/forbidden.txt")
+                    def mutate(cwd):
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text("corrupted factory data\n")
+                    self.adapter.mutations[stage] = mutate
+                    with self.assertRaisesRegex(ValueError, "forbidden paths under .factory/"):
+                        self.engine.call(stage)
+                    self.assertEqual((self.engine.work / "state.json").read_bytes(), original)
+                    if not local:
+                        self.assertFalse(target.exists())
+                    self.assertEqual(self.repo.changed_paths(self.engine.cwd), [])
+
+    def test_read_mode_cannot_delete_saved_artifacts(self):
+        self.through_plan()
+        spec = self.engine.work / "spec.md"
+        original = spec.read_bytes()
+        self.adapter.mutations["plan"] = lambda cwd: spec.unlink()
+        with self.assertRaisesRegex(ValueError, "forbidden paths under .factory/"):
+            self.engine.call("plan")
+        self.assertEqual(spec.read_bytes(), original)
+
+    def test_force_spec_plan_and_build_rewind_and_retain_document_inputs(self):
+        self.through_review()
+        for stage in ("build", "plan", "spec"):
+            with self.subTest(stage=stage):
+                self.engine = Engine(self.repo, self.github, self.config, 42).prepare()
+                spec, plan = self.engine.work / "spec.md", self.engine.work / "plan.md"
+                spec.write_text(spec.read_text() + "\nOperator spec clarification.\n")
+                plan.write_text(plan.read_text() + "\nOperator plan clarification.\n")
+                before_spec, before_plan = spec.read_bytes(), plan.read_bytes()
+                previous = {"spec": None, "plan": "spec", "build": "plan"}[stage]
+                target = (self.engine.state["stages"][previous]["commit"] if previous
+                          else self.engine.state["base"]["sha"])
+                self.engine.rewind(stage)
+                self.assertEqual(self.engine.head(), target)
+                self.assertNotIn(stage, self.engine.state["stages"])
+                self.assertEqual(self.engine.state["reviews"], [])
+                self.assertEqual(self.engine.state["fix_rounds"], 0)
+                self.assertEqual(spec.read_bytes(), before_spec)
+                self.assertEqual(plan.read_bytes(), before_plan)
+                getattr(self.engine, stage)()
+                prompt = (self.engine.work / "prompts" / f"{stage}-1.md").read_text()
+                if stage != "spec":
+                    self.assertIn("Operator spec clarification.", prompt)
+                self.assertEqual(self.engine.head(), self.remote_head())
+                self.engine = Engine(self.repo, self.github, self.config, 42).prepare()
+        self.engine.run()
+        self.assertEqual(self.engine.state["outcome"], "done")
+
+    def test_status_reads_local_state_even_without_worktree_or_branch(self):
+        self.engine.spec()
+        saved = load_json(self.engine.work / "state.json")
+        for remove in (None, "worktree", "branch"):
+            with self.subTest(remove=remove):
+                if remove == "worktree":
+                    self.repo.git("worktree", "remove", str(self.engine.cwd))
+                elif remove == "branch":
+                    self.repo.git("branch", "-D", "factory/42")
+                output = io.StringIO()
+                with patch.object(self.repo, "fetch", side_effect=AssertionError("status must not fetch")), \
+                        contextlib.redirect_stdout(output):
+                    self.assertEqual(status(self.repo, 42), 0)
+                report = json.loads(output.getvalue())
+                self.assertEqual(report["state"], saved)
+                self.assertEqual(report["worktree"], str(self.engine.cwd) if remove is None else None)
+                self.assertEqual(report["head"] is None, remove == "branch")
+
+    def test_dismiss_uses_saved_ledger_without_committing(self):
+        self.through_review(finding())
+        head = self.engine.head()
+        self.assertEqual(execute_issue(self.repo, self.github, self.config, 42, "dismiss",
+                                       finding="F1", reason="Accepted limitation."), 0)
+        resumed = Engine(self.repo, self.github, self.config, 42).prepare()
+        self.assertEqual(resumed.ledger["findings"][0]["status"], "dismissed")
+        self.assertEqual(resumed.head(), head)
+
+    def test_abandon_removes_issue_artifacts_branch_worktree_and_pr(self):
+        self.through_build()
+        other = self.repo.issue_dir(43)
+        other.mkdir(parents=True)
+        (other / "spec.md").write_text("Another issue\n")
+        with patch.object(self.github, "remove_label", create=True) as label, \
+                patch.object(self.github, "close", create=True) as close:
+            self.assertEqual(execute_issue(self.repo, self.github, self.config, 42, "abandon"), 0)
+        label.assert_called_once_with(42, "factory")
+        close.assert_called_once_with(142)
+        self.assertFalse(self.engine.work.exists())
+        self.assertFalse(self.engine.cwd.exists())
+        self.assertFalse(self.repo.branch_exists(42))
+        self.assertFalse(self.repo.branch_exists(42, remote=True))
+        self.assertTrue((other / "spec.md").exists())
+        self.assertTrue((self.repo.local_dir / "transcripts/fake-transcript.json").exists())
 
     def test_cli_rolls_back_a_failed_protected_edit_and_removes_marker(self):
         self.through_plan()

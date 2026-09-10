@@ -267,7 +267,7 @@ class PollTests(unittest.TestCase):
         self.assertEqual(self.run_poll(), 0)
         self.execute.assert_not_called()
 
-    def test_parked_gate_replays_persisted_pending_notice_after_host_rebuild(self):
+    def test_parked_gate_replays_local_pending_notice(self):
         self.github.numbers = [1]
         self.repo.add(1, remote=True, outcome="needs_human:open_questions", outcome_sha="head-1")
         path = self.repo.issue_dir(1) / "state.json"

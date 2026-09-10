@@ -90,6 +90,12 @@ class GitHub:
             handle.flush()
             self._run("pr", "comment", str(pr_number), "--body-file", handle.name)
 
+    def update_pr(self, pr_number: int, body: str) -> None:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".md") as handle:
+            handle.write(body)
+            handle.flush()
+            self._run("pr", "edit", str(issue_number(pr_number)), "--body-file", handle.name)
+
     def ready(self, pr: int) -> None:
         number = str(issue_number(pr))
         current = self._json("pr", "view", number, "--json", "state,isDraft")
