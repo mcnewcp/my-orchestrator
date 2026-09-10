@@ -4,7 +4,7 @@ A Python CLI that turns a bounded GitHub issue into a draft PR, runs spec → pl
 
 ## Install and verify
 
-Requires Linux, Python 3.12+, Git, `gh`, and a logged-in `claude` or `codex`.
+Requires Linux, Python 3.12+, `uv`, Git, `gh`, and a logged-in `claude` or `codex`.
 
 ```sh
 uv tool install .
@@ -49,4 +49,8 @@ factory abandon 42
 
 Hand code fixes must be committed inside the issue worktree. `--force` on `spec`, `plan`, or `build` rewinds the branch and pushes with an explicit lease. Repository instructions, checks, CI, and configured protected paths cannot be changed by agents; fix sessions also cannot change tests.
 
-For unattended API-key runs, see [deployment](docs/deployment.md). See [validation notes](docs/validation.md) for the tested scope and live-run evidence.
+For label-based intake, set `auth = "api"` in `factory.toml`, supply the configured
+harness's API key (`ANTHROPIC_API_KEY` or `CODEX_API_KEY`), and run `factory poll`
+from the target repository. Each invocation makes one pass over eligible issues
+with the configured intake label (`factory` by default). Poll uses `factory.toml`
+and requires API authentication; saved subscription logins are for attended runs.

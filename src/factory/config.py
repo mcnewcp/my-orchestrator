@@ -14,8 +14,8 @@ DEFAULTS = {
     },
     "poll": {"label": "factory", "max_consecutive_failures": 3},
     "harness": {
-        "claude": {"model": "", "pinned_version": ""},
-        "codex": {"model": "", "pinned_version": ""},
+        "claude": {"model": ""},
+        "codex": {"model": ""},
     },
 }
 
@@ -35,11 +35,9 @@ max_consecutive_failures = 3
 
 [harness.claude]
 model = ""
-pinned_version = "2.1.263"
 
 [harness.codex]
 model = ""
-pinned_version = "0.153.4"
 '''
 
 
@@ -88,5 +86,5 @@ def load_config(root: Path, *, optional=False) -> dict:
         raise ValueError("poll.label must be nonempty")
     for h in config["harness"].values():
         if any(not isinstance(v, str) for v in h.values()):
-            raise ValueError("harness model and pinned_version must be strings")
+            raise ValueError("harness model must be a string")
     return config

@@ -325,11 +325,6 @@ def doctor(root: Path, config: dict, harness_override: str | None = None,
     adapter = make_harness(name, root / ".factory" / "transcripts")
     version = adapter.version()
     settings = config.get("harness", {}).get(name, {})
-    warnings = []
-    pinned = settings.get("pinned_version", "")
-    installed = re.search(r"\d+\.\d+\.\d+(?:[-+][\w.-]+)?", version)
-    if pinned and (installed.group(0) if installed else version) != pinned:
-        warnings.append(f"{name} version {version!r} differs from pinned {pinned!r}")
     if name == "claude":
         numeric = re.search(r"(\d+)\.(\d+)\.(\d+)", version)
         if numeric and tuple(map(int, numeric.groups())) < (2, 1, 259):
@@ -338,7 +333,7 @@ def doctor(root: Path, config: dict, harness_override: str | None = None,
     record = {
         "factory_version": FACTORY_VERSION, "harness": name, "cli_version": version,
         "auth": auth, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "passed": False, "warnings": warnings, "binaries": binary_versions,
+        "passed": False, "warnings": [], "binaries": binary_versions,
     }
     cache_path = root / ".factory" / "doctor.json"
     try:
