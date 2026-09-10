@@ -1,7 +1,7 @@
 Address only the listed open Important findings, following AGENTS.md. Modify the
 implementation, run the configured checks, and return only the JSON object required
 by the supplied schema. Do not commit, push, or access GitHub. Do not modify tests,
-test fixtures, test configuration, or anything under work/.
+test fixtures, test configuration, or anything under .factory/.
 
 Do not modify Makefile, factory.toml, AGENTS.md, CLAUDE.md, REVIEW.md, .devcontainer/,
 .claude/, .mcp.json, .codex/, .github/, or any additional protected paths or test paths

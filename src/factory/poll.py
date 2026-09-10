@@ -55,22 +55,18 @@ def poll(repo, github, config):
             issue_key = str(issue)
             head = None
             try:
-                # Classification can commit operator edits and fast-forward. It
-                # needs the same exclusion and interrupted-stage recovery as run:
-                # partial generated artifacts must never become operator edits.
+                # Classification can fast-forward and recover interrupted work;
+                # it needs the same process exclusion as run.
                 with issue_lock(repo, issue, "poll-classify"):
                     repo.fetch()
                     exists = repo.branch_exists(issue) or repo.branch_exists(issue, remote=True)
                     state = {}
                     if exists:
-                        # Preparation also recovers a completed forced checkpoint
-                        # using its committed lease before ordinary sync checks.
                         prepared = Engine(repo, github, config, issue).prepare(create=True)
                         cwd, head, state = prepared.cwd, prepared.head(), prepared.state
                     outcome = state.get("outcome") or ""
                     if outcome == "done":
-                        # Finalization can commit done and then fail to push.
-                        # Preserve completed state remotely before parking it.
+                        # Retry any pending code push before parking the run.
                         remote_head = (repo.git("rev-parse", f"refs/remotes/origin/factory/{issue}")
                                        if repo.branch_exists(issue, remote=True) else None)
                         if remote_head != head:
@@ -88,14 +84,14 @@ def poll(repo, github, config):
                     if outcome.startswith("needs_human:") and head == repo.resolve(cwd, state["outcome_sha"]):
                         previous = failures.get(issue_key, {})
                         publication_failed = previous.get("head") == head and previous.get("count", 0) > 0
-                        notice_pending = state.get("gate_notice", {}).get("sent", True) is False
+                        notice_pending = bool(state.get("pr")) and state.get("gate_notice", {}).get("sent", True) is False
                         remote_head = (repo.git("rev-parse", f"refs/remotes/origin/factory/{issue}")
                                        if repo.branch_exists(issue, remote=True) else None)
                         if not publication_failed and not notice_pending and remote_head == head:
                             print(f"Issue #{issue}: skip {outcome}")
                             continue
-                        # A gate is committed before its push/comment. Replaying
-                        # run at that exact gate retries idempotent publication
+                        # A gate is saved before its push/comment. Replaying
+                        # run at that same SHA retries idempotent publication
                         # and exits 2 without launching a model session.
                         print(f"Issue #{issue}: retry pending gate publication")
                 code = execute_issue(repo, github, config, issue)

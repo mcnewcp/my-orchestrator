@@ -45,6 +45,7 @@ class FakeGitHub:
 
     def ensure_pr(self, issue, branch, base, title, body):
         self.pr_creates += 1
+        self.pr_body = body
         return {"number": issue + 100, "url": f"https://example.invalid/pull/{issue + 100}"}
 
     def comment(self, number, body, key):
@@ -79,16 +80,19 @@ class FakeHarness:
             output = {"markdown": "# Value\nImplement a useful value with passing checks.",
                       "open_questions": self.open_questions}
         elif stage == "plan":
-            output = {"markdown": "# Plan\n## Files that change\n- `src/value.py`\n- `tests/`\n- `work/42/plan.md`\n## Proof\nRun configured checks.\n"}
+            output = {"markdown": "# Plan\n## Files that change\n- `src/value.py`\n- `tests/`\n## Proof\nRun configured checks.\n"}
         elif stage == "build":
             output = {"summary": "Implemented the value.", "deviations": []}
         elif stage == "review":
             output = self.reviews.pop(0) if self.reviews else review()
         else:
-            ledger = load_json(cwd / "work/42/findings.json")
+            ledger = load_json(kwargs["prompt_file"].parent.parent / "findings.json")
             output = {"addressed": [{"id": f["id"], "how": "Added the guard."}
                                     for f in open_important(ledger)], "not_addressed": []}
-        return HarnessResult(output, cwd / ".factory/fake-transcript.json", 0, "fake 1.0.0")
+        transcript = cwd.parents[1] / "transcripts/fake-transcript.json"
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("{}\n")
+        return HarnessResult(output, transcript, 0, "fake 1.0.0")
 
 
 class StageTests(unittest.TestCase):
@@ -151,6 +155,10 @@ class StageTests(unittest.TestCase):
             stream.write(text)
         self.repo.commit(self.engine.cwd, "operator correction")
 
+    def operator_edit_plan(self, text):
+        with (self.engine.work / "plan.md").open("a") as stream:
+            stream.write(text)
+
     def assert_candidate_not_published(self, action, exception, message):
         local_before, remote_before = self.engine.head(), self.remote_head()
         with self.assertRaisesRegex(exception, message):
@@ -162,7 +170,7 @@ class StageTests(unittest.TestCase):
         self.engine.reload()
         self.assertEqual(self.repo.changed_paths(self.engine.cwd), [])
 
-    def test_end_to_end_run_produces_ready_pr_with_resolvable_checkpoint_handoffs(self):
+    def test_end_to_end_run_keeps_artifacts_local_and_records_plain_shas(self):
         self.engine.run()
         self.assertEqual(self.adapter.calls, ["spec", "plan", "build", "review"])
         self.assertEqual(self.github.ready_calls, [142])
@@ -236,8 +244,8 @@ class StageTests(unittest.TestCase):
 
     def test_build_cannot_change_its_factory_prompt(self):
         self.through_plan()
-        self.adapter.mutations["build"] = lambda cwd: (cwd / "work/42/prompts/build-1.md").write_text("altered audit trail\n")
-        self.assert_candidate_not_published(self.engine.build, ValueError, "prompts/build-1.md")
+        self.adapter.mutations["build"] = lambda cwd: (self.engine.work / "prompts/build-1.md").write_text("altered audit trail\n")
+        self.assert_candidate_not_published(self.engine.build, ValueError, "forbidden paths under .factory/")
 
     def test_protected_build_edit_fails_before_candidate_checks(self):
         self.through_plan()
@@ -325,6 +333,7 @@ class StageTests(unittest.TestCase):
         self.through_review(finding())
         self.engine.dismiss("F1", "Accepted bounded prototype constraint.")
         self.adapter.reviews = [review(finding("  MISSING input guard! "))]
+        self.engine.review()
         self.engine.run()
         self.assertNotIn("fix", self.adapter.calls)
         self.assertEqual(self.engine.state["reviews"][-1]["reraised_dropped"], 1)
@@ -372,11 +381,11 @@ class StageTests(unittest.TestCase):
         self.assert_candidate_not_published(self.engine.build, RuntimeError, "checks changed Git HEAD")
         self.assertEqual((self.engine.cwd / "src/value.py").read_text(), "VALUE = 0\n")
         self.assertNotIn("build", self.adapter.calls)
-        self.assertTrue(list((self.repo.local_dir / "transcripts").glob("checks-42-baseline-*.log")))
+        self.assertTrue((self.engine.work / "checks/baseline-1.log").is_file())
 
     def test_force_build_preserves_operator_plan_edits_and_rewrites_safely(self):
         self.through_build()
-        self.operator_commit("work/42/plan.md", "\nOperator clarification: keep the public interface.\n")
+        self.operator_edit_plan( "\nOperator clarification: keep the public interface.\n")
         self.engine = Engine(self.repo, self.github, self.config, 42).prepare()
         self.engine.rewind("build")
         self.engine.build()
@@ -388,7 +397,7 @@ class StageTests(unittest.TestCase):
     def test_failed_force_build_restores_original_head_operator_plan_and_ledger(self):
         self.through_review(finding())
         self.engine.dismiss("F1", "Accepted prototype limitation.")
-        self.operator_commit("work/42/plan.md", "\nOperator clarification must survive a failed build.\n")
+        self.operator_edit_plan( "\nOperator clarification must survive a failed build.\n")
         before, remote_before = self.engine.head(), self.remote_head()
         original_plan = (self.engine.work / "plan.md").read_text()
         original_ledger = load_json(self.engine.work / "findings.json")
@@ -401,42 +410,6 @@ class StageTests(unittest.TestCase):
         self.assertEqual(load_json(self.engine.work / "findings.json"), original_ledger)
         self.assertEqual(self.github.draft_calls, [])
         self.assertEqual(self.repo.changed_paths(self.engine.cwd), [])
-
-    def test_failed_force_push_retries_committed_checkpoint_without_new_harness_call(self):
-        self.through_build()
-        expected_remote = self.remote_head()
-        with patch.object(self.repo, "push", side_effect=RuntimeError("temporary force push failure")):
-            with self.assertRaisesRegex(RuntimeError, "temporary force push failure"):
-                execute_issue(self.repo, self.github, self.config, 42, "build", force=True)
-        committed = self.engine.head()
-        state = load_json(self.engine.work / "state.json")
-        self.assertEqual(state["rewrite_lease"]["expected_sha"], expected_remote)
-        self.assertEqual(self.repo.resolve(self.engine.cwd, state["rewrite_lease"]["checkpoint"]), committed)
-        self.assertNotEqual(committed, expected_remote)
-        self.assertEqual(self.remote_head(), expected_remote)
-        calls = list(self.adapter.calls)
-        self.assertEqual(execute_issue(self.repo, self.github, self.config, 42, "build"), 0)
-        self.assertEqual(self.adapter.calls, calls)
-        self.assertEqual(self.engine.head(), committed)
-        self.assertEqual(self.remote_head(), committed)
-        self.assertEqual(self.github.draft_calls, [142, 142])
-
-    def test_force_retry_refuses_a_changed_remote_lease(self):
-        self.through_build()
-        with patch.object(self.repo, "push", side_effect=RuntimeError("temporary force push failure")):
-            with self.assertRaisesRegex(RuntimeError, "temporary force push failure"):
-                execute_issue(self.repo, self.github, self.config, 42, "build", force=True)
-        pending = self.engine.head()
-        base = self.git("rev-parse", "main")
-        self.git("update-ref", "refs/heads/factory/42", base, cwd=self.remote)
-        calls = list(self.adapter.calls)
-        with patch.object(self.repo, "push", wraps=self.repo.push) as push:
-            with self.assertRaisesRegex(RuntimeError, "rewrite lease no longer matches"):
-                execute_issue(self.repo, self.github, self.config, 42, "build")
-            push.assert_not_called()
-        self.assertEqual(self.adapter.calls, calls)
-        self.assertEqual(self.engine.head(), pending)
-        self.assertEqual(self.remote_head(), base)
 
     def test_github_failure_after_commit_keeps_local_stage_for_retry(self):
         self.through_plan()
@@ -476,7 +449,7 @@ class StageTests(unittest.TestCase):
 
     def test_interrupted_force_restores_last_safe_head_and_operator_edits(self):
         self.through_build()
-        self.operator_commit("work/42/plan.md", "\nOperator clarification survives process death.\n")
+        self.operator_edit_plan( "\nOperator clarification survives process death.\n")
         self.engine = Engine(self.repo, self.github, self.config, 42).prepare()
         safe = self.engine.head()
         stopped = subprocess.Popen([sys.executable, "-c", "pass"])

@@ -94,16 +94,14 @@ def init(repo, github):
 
 
 def status(repo, issue):
+    state = load_json(repo.issue_dir(issue) / "state.json", {})
     cwd = repo.worktree(issue, create=False)
     if cwd:
-        state = load_json(cwd / "work" / str(issue) / "state.json", {})
         head = repo.head(cwd)
     elif repo.branch_exists(issue):
-        value = repo.git("show", f"factory/{issue}:work/{issue}/state.json", check=False)
-        state = json.loads(value) if value else {}
         head = repo.git("rev-parse", f"refs/heads/factory/{issue}")
     else:
-        state, head = {}, None
+        head = None
     print(json.dumps({"issue": issue, "head": head, "worktree": str(cwd) if cwd else None,
                       "state": state, "in_flight": load_json(repo.local_dir / "run" / f"{issue}.json"),
                       "note": "Local state only; status does not fetch."}, indent=2))
@@ -133,12 +131,7 @@ def execute_issue(repo, github, config, issue, command="run", *, harness=None, a
             print(f"Issue #{issue} needs human input: {exc}")
             return 2
         except BaseException:
-            # Keep completed local commits after network failures. Discard only
-            # the current uncommitted stage; transcripts live outside worktree.
-            if force and hasattr(engine, "rewind_original_head") and not engine.rewrite_checkpoint_created:
-                repo.reset(engine.cwd, engine.rewind_original_head)
-            else:
-                repo.reset(engine.cwd)
+            engine.rollback()
             raise
         print(f"Issue #{issue}: {command} complete" + (f" — {engine.state['pr']['url']}" if engine.state.get("pr") else ""))
         return 0

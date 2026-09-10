@@ -10,8 +10,9 @@ from pathlib import Path
 from .state import atomic_json, load_json, utcnow
 
 
-def record_safe_head(repo, issue: int, head: str | None = None, *, stage: str | None = None) -> None:
-    """Keep interrupted recovery anchored to the last factory-owned commit."""
+def record_safe_head(repo, issue: int, head: str | None = None, *, stage: str | None = None,
+                     state: dict | None = None, ledger: dict | None = None) -> None:
+    """Keep interrupted recovery anchored to the last saved state and code."""
     marker = repo.local_dir / "run" / f"{issue}.json"
     if not marker.exists():
         return
@@ -22,6 +23,10 @@ def record_safe_head(repo, issue: int, head: str | None = None, *, stage: str | 
         current["last_safe_head"] = head
     if stage is not None:
         current["stage"] = stage
+    if state is not None:
+        current["state"] = state
+    if ledger is not None:
+        current["ledger"] = ledger
     atomic_json(marker, current)
 
 
@@ -75,6 +80,10 @@ def issue_lock(repo, issue: int, stage: str):
                     # HEAD. Prove the object is a commit without requiring that.
                     safe = repo.git("rev-parse", "--verify", f"{safe}^{{commit}}", cwd=cwd)
                     repo.reset(cwd, safe)
+                if "state" in previous:
+                    atomic_json(repo.issue_dir(issue) / "state.json", previous["state"])
+                if "ledger" in previous:
+                    atomic_json(repo.issue_dir(issue) / "findings.json", previous["ledger"])
         atomic_json(marker, {"stage": stage, "pid": os.getpid(), "started_at": utcnow(),
                              "worktree": str(repo.local_dir / "worktrees" / str(issue))})
         try:
