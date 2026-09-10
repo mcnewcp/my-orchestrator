@@ -116,7 +116,7 @@ class RepoTests(unittest.TestCase):
         worktree = self.repo.worktree(7)
         (worktree / "moved").mkdir(parents=True)
         self.repo.git("mv", "source.txt", "moved/source.txt", cwd=worktree)
-        self.assertEqual(self.repo.changed_paths(worktree), ["source.txt", "moved/source.txt"])
+        self.assertEqual(self.repo.changed_paths(worktree), ["moved/source.txt", "source.txt"])
         with self.assertRaisesRegex(RuntimeError, "source.txt"):
             self.repo.validate_clean(worktree, 7)
         self.repo.reset(worktree)
