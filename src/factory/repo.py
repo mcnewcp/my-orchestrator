@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -40,6 +41,9 @@ class Repo:
     @staticmethod
     def branch(issue: int | str) -> str:
         return f"factory/{issue_number(issue)}"
+
+    def issue_dir(self, issue: int | str) -> Path:
+        return self.local_dir / "issues" / str(issue_number(issue))
 
     def fetch(self) -> None:
         self.git("fetch", "--prune", "origin")
@@ -92,29 +96,10 @@ class Repo:
         return self.git("rev-parse", "--verify", "HEAD", cwd=cwd)
 
     def resolve(self, cwd: Path, ref: str) -> str:
-        """Resolve immutable state references and prove that they are in HEAD's history.
-
-        State cannot contain the hash of the commit that contains state itself.
-        A checkpoint token instead names an exact commit-message trailer.
-        """
-        if ref.startswith("checkpoint:"):
-            token = ref.removeprefix("checkpoint:")
-            if not re.fullmatch(r"[A-Za-z0-9-]{1,80}", token):
-                raise RuntimeError(f"Invalid checkpoint reference: {ref!r}")
-            trailer = f"Factory-Checkpoint: {token}"
-            log = self.git("log", "--format=%H%x00%B%x00", "--fixed-strings", f"--grep={trailer}", "HEAD", cwd=cwd)
-            pieces = log.split("\0")
-            matches = [
-                pieces[index].strip() for index in range(0, len(pieces) - 1, 2)
-                if trailer in pieces[index + 1].splitlines()
-            ]
-            if len(matches) != 1:
-                raise RuntimeError(f"Checkpoint {ref} is missing or ambiguous in HEAD history")
-            sha = matches[0]
-        else:
-            if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", ref):
-                raise RuntimeError(f"Invalid recorded commit: {ref!r}")
-            sha = self.git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=cwd)
+        """Validate a recorded SHA and prove it is in HEAD's history."""
+        if not isinstance(ref, str) or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", ref):
+            raise RuntimeError(f"Invalid recorded commit: {ref!r}")
+        sha = self.git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=cwd)
         if not self._ancestor(sha, "HEAD", cwd):
             raise RuntimeError(f"Recorded commit {ref} is not reachable from HEAD")
         return sha
@@ -196,15 +181,11 @@ class Repo:
 
     def validate_clean(self, cwd: Path, issue: int | str) -> None:
         paths = self.changed_paths(cwd)
-        prefix = f"work/{issue_number(issue)}/"
-        outside = [path for path in paths if not path.startswith(prefix)]
-        if outside:
-            raise RuntimeError("Uncommitted changes outside issue artifacts: " + ", ".join(outside))
         if paths:
-            self.commit(cwd, f"factory: record operator edits for issue #{issue}")
+            raise RuntimeError("Uncommitted changes in issue worktree: " + ", ".join(paths))
 
     def diff(self, cwd: Path, base: str) -> str:
-        return self.git("diff", f"{base}...HEAD", "--", ".", ":(exclude)work", ":(exclude).factory", cwd=cwd)
+        return self.git("diff", f"{base}...HEAD", "--", ".", ":(exclude).factory", cwd=cwd)
 
     def abandon(self, issue: int | str) -> None:
         branch = self.branch(issue)
@@ -222,3 +203,6 @@ class Repo:
             self.git("worktree", "remove", "--force", str(registered))
         if self.branch_exists(issue):
             self.git("branch", "-D", branch)
+        artifacts = self.issue_dir(issue)
+        if artifacts.exists():
+            shutil.rmtree(artifacts)

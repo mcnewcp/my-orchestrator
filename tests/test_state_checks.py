@@ -122,13 +122,13 @@ class LedgerTests(unittest.TestCase):
 class EditRulesTests(unittest.TestCase):
     def setUp(self):
         self.config = {"test_paths": ["tests/", "unit.spec.js"], "protected_paths": ["ci/"]}
-        self.plan = "## Files that change\n- `src/app.py`\n- `tests/`\n- `work/42/plan.md`\n## Proof\n`make test`\n"
+        self.plan = "## Files that change\n- `src/app.py`\n- `tests/`\n## Proof\n`make test`\n"
 
     def validate(self, paths, stage="build", plan=None):
         validate_edits(paths, stage, 42, self.config, self.plan if plan is None else plan)
 
-    def test_build_exact_files_directories_and_own_plan(self):
-        self.validate(["src/app.py", "tests/nested/test_app.py", "work/42/plan.md"])
+    def test_build_exact_files_and_directories(self):
+        self.validate(["src/app.py", "tests/nested/test_app.py"])
         for path in ("src/app.py/child", "src/unplanned.py", "make test"):
             with self.subTest(path=path), self.assertRaisesRegex(ValueError, "absent from plan"):
                 self.validate([path])
@@ -147,12 +147,12 @@ class EditRulesTests(unittest.TestCase):
                 with self.subTest(stage=stage, path=path), self.assertRaisesRegex(ValueError, "forbidden paths"):
                     self.validate([path], stage, "## Files that change\n`" + path + "`\n")
 
-    def test_all_other_work_artifacts_protected(self):
-        for path in ("work/42/state.json", "work/7/plan.md", "work/42/prompts/build-1.md"):
+    def test_all_factory_artifacts_protected(self):
+        for path in (".factory/issues/42/state.json", ".factory/issues/7/plan.md", ".factory/issues/42/prompts/build-1.md"):
             with self.subTest(path=path), self.assertRaisesRegex(ValueError, "forbidden paths"):
                 self.validate([path])
-        with self.assertRaisesRegex(ValueError, "work/42/plan.md"):
-            self.validate(["work/42/plan.md"], "fix")
+        with self.assertRaisesRegex(ValueError, "forbidden paths"):
+            self.validate([".factory/issues/42/plan.md"], "fix")
 
     def test_fix_test_paths_forbidden_and_unplanned_source_allowed(self):
         self.validate(["src/unplanned.py"], "fix")
