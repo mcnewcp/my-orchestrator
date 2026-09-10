@@ -203,16 +203,18 @@ class HarnessTests(unittest.TestCase):
 
     def test_doctor_checks_real_read_and_write_and_keeps_cache_per_auth(self):
         self.settings(doctor=True)
-        config = {"factory": {"harness": "claude", "auth": "subscription", "stage_timeout_min": 1},
-                  "harness": {"claude": {"pinned_version": "2.1.259"}}}
+        config = {"factory": {"harness": "claude", "auth": "subscription", "stage_timeout_min": 1}}
         result = doctor(self.cwd, config)
         key = doctor_key("claude", "2.1.263 (Claude Code)", "subscription")
         self.assertEqual(result["selected"], key)
         self.assertTrue(result["records"][key]["passed"])
-        self.assertIn("differs from pinned", result["records"][key]["warnings"][0])
+        self.assertEqual(result["records"][key]["cli_version"], "2.1.263 (Claude Code)")
+        self.assertEqual(result["records"][key]["warnings"], [])
         api_result = doctor(self.cwd, config, "codex", "api")
         self.assertEqual(len(api_result["records"]), 2)
         self.assertTrue(api_result["passed"])
+        self.assertEqual(api_result["records"][api_result["selected"]]["cli_version"], "codex-cli 0.153.4")
+        self.assertEqual(api_result["records"][api_result["selected"]]["warnings"], [])
         self.assertEqual(list((self.cwd / ".factory/tmp").iterdir()), [])
 
     def test_doctor_does_not_trust_claim_of_write(self):
