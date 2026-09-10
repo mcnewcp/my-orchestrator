@@ -12,7 +12,7 @@ import subprocess
 
 PROTECTED_PATHS = (
     "Makefile", "factory.toml", "AGENTS.md", "CLAUDE.md", "REVIEW.md",
-    ".devcontainer/", ".claude/", ".mcp.json", ".codex/", ".github/",
+    ".devcontainer/", ".claude/", ".mcp.json", ".codex/", ".github/", ".factory/",
 )
 _ENV = {"PATH", "HOME", "LANG", "LANGUAGE", "TMPDIR", "TMP", "TEMP"}
 _CONFIG_DIR = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
@@ -100,8 +100,6 @@ def validate_edits(paths: list[str], stage: str, issue: int, config: dict,
     normalized = [_path(path) for path in paths]
     violations = [path for path in normalized
                   if any(_matches(path, rule) for rule in protected)
-                  or (_matches(path, "work/")
-                      and not (stage == "build" and path == f"work/{issue}/plan.md"))
                   or (stage == "fix" and any(_matches(path, rule) for rule in tests))]
     if violations:
         raise ValueError(f"{stage} modified forbidden paths: " + ", ".join(sorted(set(violations))))

@@ -39,6 +39,9 @@ class FakeRepo:
         if local:
             self.worktree(issue)
 
+    def issue_dir(self, issue):
+        return self.local_dir / "issues" / str(issue)
+
     def fetch(self):
         self.events.append(("fetch",))
         if self.fetch_error:
@@ -57,7 +60,7 @@ class FakeRepo:
         entry["local"] = True
         if not path.exists():
             path.mkdir(parents=True)
-            atomic_json(path / "work" / str(issue) / "state.json", entry["state"])
+            atomic_json(self.issue_dir(issue) / "state.json", entry["state"])
             self.events.append(("create", issue))
         return path
 
@@ -264,12 +267,13 @@ class PollTests(unittest.TestCase):
         self.assertEqual(self.run_poll(), 0)
         self.execute.assert_not_called()
 
-    def test_parked_gate_replays_persisted_pending_notice_after_host_rebuild(self):
+    def test_parked_gate_replays_local_pending_notice(self):
         self.github.numbers = [1]
         self.repo.add(1, remote=True, outcome="needs_human:open_questions", outcome_sha="head-1")
-        path = self.repo.worktree(1) / "work/1/state.json"
+        path = self.repo.issue_dir(1) / "state.json"
         state = load_json(path)
-        state["gate_notice"] = {"ref": "head-1", "sent": False}
+        state["gate_notice"] = {"sha": "head-1", "sent": False}
+        state["pr"] = {"number": 101}
         atomic_json(path, state)
         self.execute.return_value = 2
         self.assertEqual(self.failures(), {})
@@ -382,7 +386,7 @@ class PollTests(unittest.TestCase):
     def test_unreachable_recorded_commit_fails_before_execution(self):
         self.github.numbers = [1]
         self.repo.add(1)
-        path = self.repo.worktree(1) / "work/1/state.json"
+        path = self.repo.issue_dir(1) / "state.json"
         state = load_json(path)
         state["stages"] = {"spec": {"commit": "unreachable"}}
         atomic_json(path, state)

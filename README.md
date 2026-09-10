@@ -29,13 +29,15 @@ factory status 42
 
 Use the new issue's number instead of `42`. Run `factory run 42 --harness codex --auth subscription` to use Codex. Each session uses the selected CLI's default model unless configured otherwise.
 
-Inspect `.factory/worktrees/42/work/42/` for the intent, spec, plan, check logs, prompts, state, and findings ledger; the same files are committed on `factory/42`. Transcripts are under `.factory/transcripts/`.
+Inspect `.factory/issues/42/` in the target repo root for the intent, spec, plan, check logs, prompts, state, findings ledger, and review/fix outputs. These ignored files stay on this machine; `factory/42` contains only build and fix commits. Transcripts are under `.factory/transcripts/` and the code worktree is under `.factory/worktrees/42/`. Keep `.factory/issues/` to resume runs locally; cloning the branch does not restore run state.
+
+The draft PR is opened after build produces code changes. Its body and the final summary comment include the spec and plan in collapsed sections. Before build, gates are reported locally by the CLI and `factory status`.
 
 Exit `0` means complete, `1` means failure (correct it and retry), and `2` means human input is needed. An unchanged parked run makes no model calls.
 
 ```sh
 # Resolve a spec gate:
-$EDITOR .factory/worktrees/42/work/42/spec.md
+$EDITOR .factory/issues/42/spec.md
 factory accept 42
 factory run 42
 
@@ -43,11 +45,13 @@ factory run 42
 factory dismiss 42 F3 "Reason this finding does not apply"
 factory build 42 --force
 
-# Remove intake label, close PR, and delete the factory branch/worktree:
+# Remove intake label, close PR, and delete the branch, worktree, and issue artifacts:
 factory abandon 42
 ```
 
-Hand code fixes must be committed inside the issue worktree. `--force` on `spec`, `plan`, or `build` rewinds the branch and pushes with an explicit lease. Repository instructions, checks, CI, and configured protected paths cannot be changed by agents; fix sessions also cannot change tests.
+Hand code fixes must be committed inside the issue worktree. Edit spec and plan markdown directly in `.factory/issues/42/`; they need no commit. `--force` on `spec`, `plan`, or `build` rewinds the branch to the previous stage's SHA (the original base for spec) and pushes with an explicit lease. Edited markdown remains available as input to the rerun; spec and plan replace their own generated output. A failed forced stage or force push restores the previous run so you can retry with `--force`.
+
+Repository instructions, checks, CI, configured protected paths, and `.factory/` cannot be changed by agents; fix sessions also cannot change tests. Build reports deviations in its JSON output; only the operator may edit the saved plan.
 
 For label-based intake, set `auth = "api"` in `factory.toml`, supply the configured
 harness's API key (`ANTHROPIC_API_KEY` or `CODEX_API_KEY`), and run `factory poll`

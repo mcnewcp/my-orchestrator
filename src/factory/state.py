@@ -1,4 +1,4 @@
-"""Atomic branch state and the deterministic review ledger."""
+"""Atomic local state and the deterministic review ledger."""
 
 from __future__ import annotations
 

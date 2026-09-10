@@ -59,52 +59,54 @@ class RepoTests(unittest.TestCase):
         self.assertEqual(worktree, self.repo.worktree(7, create=False))
         self.assertEqual(self.repo.head(worktree), self.repo.head(self.checkout))
 
-    def test_rebuild_recovers_remote_state_and_deleted_registration(self):
+    def test_rebuild_recovers_code_and_keeps_artifacts_on_the_same_machine(self):
         worktree = self.repo.worktree(7)
-        artifact = worktree / "work/7/state.json"
+        artifact = self.repo.issue_dir(7) / "state.json"
         artifact.parent.mkdir(parents=True)
         artifact.write_text('{"stage": "spec"}\n')
-        expected = self.repo.commit(worktree, "spec")
+        (worktree / "source.txt").write_text("implementation\n")
+        expected = self.repo.commit(worktree, "build")
         self.repo.push(7)
-        shutil.rmtree(self.repo.local_dir)
+        shutil.rmtree(worktree)
         recovered = self.repo.worktree(7)
         self.assertEqual(self.repo.head(recovered), expected)
+        self.assertTrue(artifact.is_file())
         rebuilt = Repo(self.clone())
         rebuilt.fetch()
-        self.assertFalse(rebuilt.branch_exists(7))
-        self.assertTrue(rebuilt.branch_exists(7, remote=True))
         recovered = rebuilt.worktree(7)
-        self.assertEqual(self.repo.head(recovered), expected)
-        self.assertEqual((recovered / "work/7/state.json").read_text(), artifact.read_text())
+        self.assertEqual(rebuilt.head(recovered), expected)
+        self.assertFalse(rebuilt.issue_dir(7).exists())
 
-    def test_commit_is_idempotent_and_preserves_checkpoint_trailer(self):
+    def test_commit_is_idempotent_and_resolves_plain_sha(self):
         worktree = self.repo.worktree(7)
         (worktree / "source.txt").write_text("new\n")
-        sha = self.repo.commit(worktree, "build\n\nFactory-Checkpoint: abcd-1234")
-        self.assertEqual(self.repo.resolve(worktree, "checkpoint:abcd-1234"), sha)
+        sha = self.repo.commit(worktree, "build")
         self.assertEqual(self.repo.resolve(worktree, sha), sha)
         self.assertEqual(self.repo.commit(worktree, "already committed"), sha)
-        with self.assertRaisesRegex(RuntimeError, "missing or ambiguous"):
-            self.repo.resolve(worktree, "checkpoint:abcd")
+        for invalid in ("HEAD", "abcd", None):
+            with self.subTest(ref=invalid), self.assertRaisesRegex(RuntimeError, "Invalid recorded commit"):
+                self.repo.resolve(worktree, invalid)
 
-    def test_checkpoint_resolves_older_commit_and_rejects_unreachable_commit(self):
+    def test_resolves_older_sha_and_rejects_unreachable_commit(self):
         worktree = self.repo.worktree(7)
         (worktree / "source.txt").write_text("first\n")
-        first = self.repo.commit(worktree, "first\n\nFactory-Checkpoint: 1234")
+        first = self.repo.commit(worktree, "first")
         (worktree / "source.txt").write_text("second\n")
-        self.repo.commit(worktree, "second\n\nFactory-Checkpoint: 5678")
-        self.assertEqual(self.repo.resolve(worktree, "checkpoint:1234"), first)
+        self.repo.commit(worktree, "second")
+        self.assertEqual(self.repo.resolve(worktree, first), first)
         (self.checkout / "other.txt").write_text("other history\n")
         unreachable = self.repo.commit(self.checkout, "on main")
         with self.assertRaisesRegex(RuntimeError, "not reachable"):
             self.repo.resolve(worktree, unreachable)
 
-    def test_operator_artifacts_are_committed_but_code_dirt_is_refused(self):
+    def test_operator_artifacts_stay_local_and_code_dirt_is_refused(self):
         worktree = self.repo.worktree(7)
-        artifact = worktree / "work/7/spec.md"
+        before = self.repo.head(worktree)
+        artifact = self.repo.issue_dir(7) / "spec.md"
         artifact.parent.mkdir(parents=True)
         artifact.write_text("operator edit\n")
         self.repo.validate_clean(worktree, 7)
+        self.assertEqual(self.repo.head(worktree), before)
         self.assertEqual(self.repo.changed_paths(worktree), [])
         (worktree / "source.txt").write_text("uncommitted code\n")
         with self.assertRaisesRegex(RuntimeError, "source.txt"):
@@ -112,9 +114,9 @@ class RepoTests(unittest.TestCase):
 
     def test_renames_check_both_paths_and_support_unusual_names(self):
         worktree = self.repo.worktree(7)
-        (worktree / "work/7").mkdir(parents=True)
-        self.repo.git("mv", "source.txt", "work/7/source.txt", cwd=worktree)
-        self.assertEqual(self.repo.changed_paths(worktree), ["source.txt", "work/7/source.txt"])
+        (worktree / "moved").mkdir(parents=True)
+        self.repo.git("mv", "source.txt", "moved/source.txt", cwd=worktree)
+        self.assertEqual(self.repo.changed_paths(worktree), ["moved/source.txt", "source.txt"])
         with self.assertRaisesRegex(RuntimeError, "source.txt"):
             self.repo.validate_clean(worktree, 7)
         self.repo.reset(worktree)
@@ -144,17 +146,17 @@ class RepoTests(unittest.TestCase):
         self.assertNotEqual(renamed, deleted)
         self.assertEqual(self.repo.changed_paths(worktree), [])
 
-    def test_review_diff_excludes_work_artifacts(self):
+    def test_review_diff_includes_only_code_changes(self):
         worktree = self.repo.worktree(7)
         base = self.repo.head(worktree)
         (worktree / "source.txt").write_text("implementation\n")
-        (worktree / "work/7").mkdir(parents=True)
-        (worktree / "work/7/plan.md").write_text("PLAN SECRET\n")
+        self.repo.issue_dir(7).mkdir(parents=True)
+        (self.repo.issue_dir(7) / "plan.md").write_text("PLAN SECRET\n")
         self.repo.commit(worktree, "build")
         diff = self.repo.diff(worktree, base)
         self.assertIn("implementation", diff)
         self.assertNotIn("PLAN SECRET", diff)
-        self.assertNotIn("work/7", diff)
+        self.assertNotIn(".factory/", diff)
 
     def test_sync_fast_forwards_and_refuses_divergence(self):
         worktree = self.repo.worktree(7)
@@ -208,7 +210,10 @@ class RepoTests(unittest.TestCase):
         worktree = self.repo.worktree(7)
         main = self.repo.head(self.checkout)
         self.repo.push(7)
+        self.repo.issue_dir(7).mkdir(parents=True)
+        (self.repo.issue_dir(7) / "state.json").write_text("{}\n")
         self.repo.abandon(7)
+        self.assertFalse(self.repo.issue_dir(7).exists())
         self.assertFalse(worktree.exists())
         self.assertFalse(self.repo.branch_exists(7))
         self.assertFalse(self.repo.branch_exists(7, remote=True))
@@ -259,6 +264,13 @@ class GitHubTests(unittest.TestCase):
         self.assertEqual(api.bodies, [body])
         self.assertIn("--draft", api.calls[1])
         self.assertNotIn("--body", api.calls[1])
+
+    def test_pr_document_refresh_preserves_exact_markdown(self):
+        api = RecordingGitHub(["updated"])
+        body = "<details>\n<summary>Plan</summary>\n\nLiteral `code` and $(text)\n\n</details>\n"
+        api.update_pr(23, body)
+        self.assertEqual(api.calls[0][:3], ("pr", "edit", "23"))
+        self.assertEqual(api.bodies, [body])
 
     def test_comment_deduplicates_only_own_exact_marker(self):
         for author, expected_calls in [("operator", 2), ("somebody-else", 3)]:
