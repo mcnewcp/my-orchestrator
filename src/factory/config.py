@@ -5,22 +5,27 @@ import tomllib
 from pathlib import Path
 
 
+ROLES = ("spec", "plan", "build", "review", "fix")
+RUN_FIELDS = ("harness", "model", "effort")
+EFFORTS = ("", "low", "medium", "high", "max")
+
+
 DEFAULTS = {
     "factory": {
         "harness": "claude", "auth": "api", "base_branch": "main",
+        "model": "", "effort": "",
         "max_fix_rounds": 3, "stage_timeout_min": 45,
         "checks": [["make", "test"], ["make", "lint"]],
         "test_paths": ["tests/"], "protected_paths": [],
     },
     "poll": {"label": "factory", "max_consecutive_failures": 3},
-    "harness": {
-        "claude": {"model": ""},
-        "codex": {"model": ""},
-    },
+    "roles": {role: {} for role in ROLES},
 }
 
 TEMPLATE = '''[factory]
 harness = "claude"
+model = "" # empty model/effort uses the harness CLI default
+effort = ""
 auth = "api" # use "subscription" for attended runs with a saved login
 base_branch = "main"
 max_fix_rounds = 3
@@ -33,12 +38,51 @@ protected_paths = []
 label = "factory"
 max_consecutive_failures = 3
 
-[harness.claude]
-model = ""
+[roles.review]
+# model = "opus"
+# effort = "high"
 
-[harness.codex]
-model = ""
+[roles.build]
+# harness = "codex"
 '''
+
+
+def resolve_role(config: dict, role: str | None = None, *, harness=None,
+                 model=None, effort=None) -> dict:
+    """Resolve each field independently; explicit empty strings stop inheritance."""
+    if role is not None and role not in ROLES:
+        raise ValueError(f"unknown configuration key: roles.{role}")
+    defaults = config.get("factory", {})
+    settings = config.get("roles", {}).get(role, {}) if role else {}
+    overrides = dict(harness=harness, model=model, effort=effort)
+    resolved, keys = {}, {}
+    for field in RUN_FIELDS:
+        if overrides[field] is not None:
+            value, key = overrides[field], f"--{field}"
+        elif field in settings:
+            value, key = settings[field], f"roles.{role}.{field}"
+        else:
+            value, key = defaults.get(field, DEFAULTS["factory"][field]), f"factory.{field}"
+        if not isinstance(value, str):
+            raise ValueError(f"{key} must be a string")
+        resolved[field], keys[field] = value, key
+    if resolved["harness"] not in ("claude", "codex"):
+        raise ValueError(f"{keys['harness']} must be claude or codex")
+    if resolved["effort"] not in EFFORTS:
+        raise ValueError(f"{keys['effort']} must be empty, low, medium, high, or max (Claude only)")
+    if resolved["effort"] == "max" and resolved["harness"] != "claude":
+        context = f" for roles.{role}" if role else ""
+        raise ValueError(f"{keys['effort']}{context}: max is supported only by claude, not {resolved['harness']}")
+    return resolved
+
+
+def harness_settings(config: dict, **overrides) -> dict:
+    """One probe per harness: factory settings first, then the first using role."""
+    selected = {}
+    for role in (None, *ROLES):
+        settings = resolve_role(config, role, **overrides)
+        selected.setdefault(settings["harness"], settings)
+    return selected
 
 
 def load_config(root: Path, *, optional=False) -> dict:
@@ -50,9 +94,10 @@ def load_config(root: Path, *, optional=False) -> dict:
 
     def merge(target, incoming, prefix=""):
         for key, value in incoming.items():
-            if key not in target:
+            role_field = prefix in (f"roles.{role}." for role in ROLES) and key in RUN_FIELDS
+            if key not in target and not role_field:
                 raise ValueError(f"unknown configuration key: {prefix}{key}")
-            if isinstance(target[key], dict):
+            if isinstance(target.get(key), dict):
                 if not isinstance(value, dict):
                     raise ValueError(f"expected table: {prefix}{key}")
                 merge(target[key], value, f"{prefix}{key}.")
@@ -61,8 +106,8 @@ def load_config(root: Path, *, optional=False) -> dict:
 
     merge(config, raw)
     f = config["factory"]
-    if f["harness"] not in ("claude", "codex"):
-        raise ValueError("factory.harness must be claude or codex")
+    resolve_role(config)
+    config["roles"] = {role: resolve_role(config, role) for role in ROLES}
     if f["auth"] not in ("api", "subscription"):
         raise ValueError("factory.auth must be api or subscription")
     for name in ("max_fix_rounds", "stage_timeout_min"):
@@ -84,7 +129,4 @@ def load_config(root: Path, *, optional=False) -> dict:
         raise ValueError("poll.max_consecutive_failures must be positive")
     if not isinstance(poll["label"], str) or not poll["label"].strip():
         raise ValueError("poll.label must be nonempty")
-    for h in config["harness"].values():
-        if any(not isinstance(v, str) for v in h.values()):
-            raise ValueError("harness model must be a string")
     return config

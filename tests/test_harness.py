@@ -157,6 +157,23 @@ class HarnessTests(unittest.TestCase):
                 self.run_harness(name, auth="api", env=env)
         self.assertEqual(self.calls(), [])
 
+    def test_model_and_effort_command_flags_and_cli_defaults(self):
+        for name, model_flag, effort_flag in (("claude", "--model", "--effort"), ("codex", "-m", "-c")):
+            adapter = make_harness(name, self.transcripts)
+            for model, effort in ((None, None), ("", ""), ("chosen-model", "high"), ("", "low")):
+                for mode in ("read", "write"):
+                    with self.subTest(name=name, model=model, effort=effort, mode=mode):
+                        args = adapter.command(prompt_file=self.prompt, schema_file=self.schema, schema={},
+                                               mode=mode, model=model, effort=effort, auth="subscription",
+                                               cwd=self.cwd, last_file=self.transcripts / "last.json")
+                        self.assertEqual(model_flag in args, bool(model))
+                        self.assertEqual(effort_flag in args, bool(effort))
+                        if model:
+                            self.assertEqual(args[args.index(model_flag) + 1], model)
+                        if effort:
+                            expected = effort if name == "claude" else f"model_reasoning_effort={effort}"
+                            self.assertEqual(args[args.index(effort_flag) + 1], expected)
+
     def test_failure_retains_both_streams(self):
         self.settings(exit_code=9, stderr="rate limited")
         with self.assertRaisesRegex(RuntimeError, "exited 9.*transcript:"):
@@ -206,30 +223,31 @@ class HarnessTests(unittest.TestCase):
         config = {"factory": {"harness": "claude", "auth": "subscription", "stage_timeout_min": 1}}
         result = doctor(self.cwd, config)
         key = doctor_key("claude", "2.1.263 (Claude Code)", "subscription")
-        self.assertEqual(result["selected"], key)
+        self.assertEqual(result["harnesses"]["claude"], result["records"][key])
         self.assertTrue(result["records"][key]["passed"])
         self.assertEqual(result["records"][key]["cli_version"], "2.1.263 (Claude Code)")
         self.assertEqual(result["records"][key]["warnings"], [])
         api_result = doctor(self.cwd, config, "codex", "api")
         self.assertEqual(len(api_result["records"]), 2)
         self.assertTrue(api_result["passed"])
-        self.assertEqual(api_result["records"][api_result["selected"]]["cli_version"], "codex-cli 0.153.4")
-        self.assertEqual(api_result["records"][api_result["selected"]]["warnings"], [])
+        self.assertEqual(api_result["harnesses"]["codex"]["cli_version"], "codex-cli 0.153.4")
+        self.assertEqual(api_result["harnesses"]["codex"]["warnings"], [])
         self.assertEqual(list((self.cwd / ".factory/tmp").iterdir()), [])
 
     def test_doctor_does_not_trust_claim_of_write(self):
         self.settings(doctor=True, skip_write=True)
         config = {"factory": {"harness": "codex", "auth": "subscription"}}
-        with self.assertRaisesRegex(RuntimeError, "did not create.*transcript:"):
-            doctor(self.cwd, config)
+        result = doctor(self.cwd, config)
+        self.assertRegex(result["harnesses"]["codex"]["error"], "did not create.*transcript:")
         cache = json.loads((self.cwd / ".factory/doctor.json").read_text())
         self.assertFalse(cache["passed"])
-        self.assertFalse(cache["records"][cache["selected"]]["passed"])
+        self.assertFalse(cache["harnesses"]["codex"]["passed"])
 
     def test_doctor_read_mode_must_not_mutate_files(self):
         self.settings(doctor=True, dirty_read=True)
-        with self.assertRaisesRegex(RuntimeError, "read probe failed"):
-            doctor(self.cwd, {"factory": {"auth": "subscription"}})
+        result = doctor(self.cwd, {"factory": {"auth": "subscription"}})
+        self.assertFalse(result["passed"])
+        self.assertIn("read probe failed", result["harnesses"]["claude"]["error"])
 
     def test_doctor_missing_key_fails_before_github(self):
         del os.environ["ANTHROPIC_API_KEY"]

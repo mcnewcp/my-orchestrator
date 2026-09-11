@@ -1,6 +1,7 @@
 """One-shot unattended discovery; all workflow decisions remain local."""
 
 from .checks import filtered_env
+from .config import harness_settings
 from .harness import doctor, doctor_key, make_harness
 from .locks import file_lock, issue_lock
 from .stages import Engine
@@ -31,18 +32,23 @@ def poll(repo, github, config):
     options = config["factory"]
     if options["auth"] != "api":
         raise ValueError("poll requires auth=api; subscription is attended only")
-    name = options["harness"]
-    filtered_env(harness=name, auth="api")  # Before any GitHub read or write.
+    harnesses = harness_settings(config)
+    for name in harnesses:
+        filtered_env(harness=name, auth="api")  # Before any GitHub read or write.
     with file_lock(repo.local_dir / "run" / "poll.lock", skip=True) as acquired:
         if not acquired:
             print("Another poll is running; skipping.")
             return 0
         # Include a first-time doctor in the poll lock. Two fresh poll processes
         # must not race the probe or contend for the shared harness lock.
-        version = make_harness(name, repo.local_dir / "transcripts").version()
-        key = doctor_key(name, version, "api")
         cache = load_json(repo.local_dir / "doctor.json", {})
-        if not cache.get("records", {}).get(key, {}).get("passed"):
+        missing = []
+        for name in harnesses:
+            version = make_harness(name, repo.local_dir / "transcripts").version()
+            key = doctor_key(name, version, "api")
+            if not cache.get("records", {}).get(key, {}).get("passed"):
+                missing.append(name)
+        if missing:
             with file_lock(repo.local_dir / "run" / "harness.lock"):
                 if not doctor(repo.root, config)["passed"]:
                     raise RuntimeError("doctor failed; refusing unattended work")

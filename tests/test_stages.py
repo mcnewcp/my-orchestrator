@@ -4,6 +4,7 @@ import copy
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -11,8 +12,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from factory.cli import execute_issue, status
-from factory.config import DEFAULTS
+from factory.cli import execute_issue, main, status
+from factory.config import DEFAULTS, load_config
 from factory.harness import HarnessResult
 from factory.repo import Repo
 from factory.stages import Engine, NeedsHuman
@@ -67,6 +68,7 @@ class FakeGitHub:
 class FakeHarness:
     def __init__(self):
         self.calls = []
+        self.invocations = []
         self.open_questions = []
         self.reviews = []
         self.mutations = {}
@@ -74,6 +76,7 @@ class FakeHarness:
     def run(self, **kwargs):
         stage = kwargs["schema_file"].stem
         self.calls.append(stage)
+        self.invocations.append(kwargs)
         cwd = kwargs["cwd"]
         if stage in self.mutations:
             self.mutations[stage](cwd)
@@ -211,6 +214,97 @@ class StageTests(unittest.TestCase):
         rebuilt.run()
         self.assertEqual(self.github.ready_calls, [142])
         self.assertEqual(self.adapter.calls, ["spec", "plan", "build", "review"])
+
+    def test_two_harness_run_resolves_every_role_and_saves_actual_provenance(self):
+        (self.root / "factory.toml").write_text('''[factory]
+model = "default-model"
+effort = "medium"
+checks = [["make", "test"]]
+[roles.plan]
+model = ""
+effort = ""
+[roles.build]
+harness = "codex"
+model = "build-model"
+effort = "high"
+[roles.review]
+model = "review-model"
+effort = "max"
+[roles.fix]
+harness = "codex"
+model = "fix-model"
+effort = "low"
+''')
+        config = load_config(self.root)
+        codex = FakeHarness()
+        self.adapter.reviews = [review(finding()), review(updates=[update("F1")])]
+        adapters = {"claude": self.adapter, "codex": codex}
+        with patch("factory.stages.make_harness", side_effect=lambda name, path: adapters[name]), \
+                patch.dict(os.environ, {"ANTHROPIC_API_KEY": "fake-claude", "CODEX_API_KEY": "fake-codex"}):
+            engine = Engine(self.repo, self.github, config, 42).prepare()
+            engine.run()
+        expected = {
+            "spec": ("claude", "default-model", "medium"),
+            "plan": ("claude", None, None),
+            "build": ("codex", "build-model", "high"),
+            "review": ("claude", "review-model", "max"),
+            "fix": ("codex", "fix-model", "low"),
+        }
+        self.assertEqual(self.adapter.calls, ["spec", "plan", "review", "review"])
+        self.assertEqual(codex.calls, ["build", "fix"])
+        for name, adapter in adapters.items():
+            for call in adapter.invocations:
+                stage = call["schema_file"].stem
+                self.assertEqual((name, call["model"], call["effort"]), expected[stage])
+                key, other = ("ANTHROPIC_API_KEY", "CODEX_API_KEY") if name == "claude" else ("CODEX_API_KEY", "ANTHROPIC_API_KEY")
+                self.assertIn(key, call["env"])
+                self.assertNotIn(other, call["env"])
+        state = load_json(engine.work / "state.json")
+        records = list(state["stages"].items()) + [("review", record) for record in state["reviews"]] + [("fix", state["fixes"][0])]
+        for stage, record in records:
+            name, model, effort = expected[stage]
+            self.assertEqual((record["harness"], record["model"], record["effort"]),
+                             (name, model or "CLI default", effort or "CLI default"))
+            self.assertEqual(record["auth"], "api")
+            self.assertEqual(record["cli_version"], "fake 1.0.0")
+        self.assertEqual(state["fixes"][0]["commit"], engine.head())
+        self.assertEqual(state["outcome"], "done")
+        self.assertEqual(self.github.ready_calls, [142])
+        # Resuming with different overrides must retain the recorded settings.
+        resumed = Engine(self.repo, self.github, config, 42, harness="claude", model="new", effort="low").prepare()
+        resumed.run()
+        self.assertEqual(load_json(engine.work / "state.json"), state)
+        self.assertEqual(len(codex.calls) + len(self.adapter.calls), 6)
+
+    def test_cli_overrides_apply_to_entire_run_including_review_and_fix(self):
+        (self.root / "factory.toml").write_text('''[factory]
+model = "configured-model"
+effort = "high"
+checks = [["make", "test"]]
+[roles.review]
+effort = "max"
+[roles.build]
+harness = "codex"
+''')
+        self.adapter.reviews = [review(finding()), review(updates=[update("F1")])]
+        with patch("factory.cli.Path.cwd", return_value=self.root), \
+                patch("factory.cli.GitHub", return_value=self.github), \
+                patch("factory.stages.make_harness") as make:
+            def adapter(name, path):
+                self.assertEqual(name, "codex")
+                return self.adapter
+            make.side_effect = adapter
+            self.assertEqual(main(["--harness", "codex", "run", "42", "--model", "",
+                                   "--effort", "", "--auth", "subscription"]), 0)
+        self.assertEqual(self.adapter.calls, ["spec", "plan", "build", "review", "fix", "review"])
+        for call in self.adapter.invocations:
+            self.assertIsNone(call["model"])
+            self.assertIsNone(call["effort"])
+            self.assertEqual(call["auth"], "subscription")
+        state = load_json(self.engine.work / "state.json")
+        for record in [*state["stages"].values(), *state["reviews"], *state["fixes"]]:
+            self.assertEqual((record["harness"], record["model"], record["effort"]),
+                             ("codex", "CLI default", "CLI default"))
 
     def test_open_questions_park_unchanged_without_new_harness_calls(self):
         self.adapter.open_questions = ["What value is required?"]
