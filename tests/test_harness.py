@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import time
 from types import SimpleNamespace
@@ -346,6 +347,18 @@ harness = "codex"
         self.assertEqual(self.calls(), [])
 
 
+# Engine.prompt substitutes exactly these names, and each role receives these inputs.
+ROLE_PLACEHOLDERS = frozenset(
+    ("intent", "spec", "plan", "diff", "checks", "review_policy", "ledger", "findings"))
+ROLE_INPUTS = {
+    "spec": {"intent"},
+    "plan": {"spec"},
+    "build": {"spec", "plan", "checks"},
+    "review": {"spec", "plan", "diff", "checks", "review_policy", "ledger"},
+    "fix": {"findings", "checks"},
+}
+
+
 class SchemaTests(unittest.TestCase):
     def test_review_nested_contract_requires_evidence_and_enums(self):
         schema = json.loads((Path(__file__).parents[1] / "src/factory/schemas/review.json").read_text())
@@ -364,10 +377,16 @@ class SchemaTests(unittest.TestCase):
 
     def test_roles_render_with_documented_inputs(self):
         directory = Path(__file__).parents[1] / "src/factory/roles"
-        context = {key: "fixture" for key in ("intent", "spec", "plan", "diff", "checks", "review_policy", "ledger", "findings")}
-        for template in directory.glob("*.md"):
-            with self.subTest(role=template.name):
-                self.assertIn("fixture", template.read_text().format(**context))
+        self.assertEqual({path.stem for path in directory.glob("*.md")}, set(ROLE_INPUTS))
+        context = {key: f"<{key} here>" for key in ROLE_PLACEHOLDERS}
+        for role, inputs in ROLE_INPUTS.items():
+            with self.subTest(role=role):
+                template = (directory / f"{role}.md").read_text()
+                self.assertEqual(set(re.findall(r"\{(\w+)\}", template)), inputs)
+                # format() also proves the template carries no other curly braces.
+                rendered = template.format(**context)
+                for key in ROLE_PLACEHOLDERS:
+                    self.assertEqual(f"<{key} here>" in rendered, key in inputs, key)
 
 
 if __name__ == "__main__":

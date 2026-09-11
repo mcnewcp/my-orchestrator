@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from factory.cli import execute_issue, main, status
+from factory.cli import REVIEW, execute_issue, main, status
 from factory.config import DEFAULTS, load_config
 from factory.harness import HarnessResult
 from factory.repo import Repo
@@ -178,6 +178,37 @@ class StageTests(unittest.TestCase):
         self.repo.reset(self.engine.cwd, local_before)
         self.engine.reload()
         self.assertEqual(self.repo.changed_paths(self.engine.cwd), [])
+
+    def policy_lines(self, stage, number=1):
+        prompt = (self.engine.work / "prompts" / f"{stage}-{number}.md").read_text()
+        self.assertNotIn("Python owns", prompt)
+        self.assertIn("\n---\n", prompt)
+        return prompt.split("\n---\n")[-1].strip().splitlines()
+
+    def test_appended_policy_carries_only_the_machine_enforced_facts(self):
+        self.config["factory"]["protected_paths"] = ["ci/"]
+        self.through_review(finding())
+        self.engine.fix()
+        checks = json.dumps(self.config["factory"]["checks"])
+        for stage, mode in (("spec", "read-only"), ("plan", "read-only"), ("build", "write"),
+                            ("review", "read-only"), ("fix", "write")):
+            with self.subTest(stage=stage):
+                lines = self.policy_lines(stage)
+                self.assertEqual(len(lines), 5 if stage == "fix" else 4)
+                self.assertEqual(lines[0], f"Issue: 42. Artifacts: {self.engine.work}/.")
+                self.assertEqual(lines[1], f"Configured checks: {checks}")
+                self.assertIn('"Makefile"', lines[2])
+                self.assertIn('".factory/"', lines[2])
+                self.assertIn('"ci/"', lines[2])
+                self.assertTrue(lines[3].startswith(f"Mode: {mode}"), lines[3])
+        self.assertEqual(self.policy_lines("fix")[4], 'Test paths: ["tests/"]')
+
+    def test_default_review_policy_template_supplies_only_the_nit_cap(self):
+        (self.root / "REVIEW.md").write_text(REVIEW)
+        self.assertEqual(self.engine.nit_cap(), 5)
+        self.through_review(finding())
+        self.assertNotIn("nit_cap", (self.engine.work / "prompts/spec-1.md").read_text())
+        self.assertIn("nit_cap: 5", (self.engine.work / "prompts/review-1.md").read_text())
 
     def test_end_to_end_run_keeps_artifacts_local_and_records_plain_shas(self):
         self.engine.run()

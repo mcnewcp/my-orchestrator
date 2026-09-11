@@ -18,19 +18,12 @@ from .state import load_json
 
 REVIEW = """# Review policy
 
-Review in three passes: bugs, security, and compliance with spec.md and plan.md.
-Raise an Important finding only for a concrete defect that blocks acceptance.
-Each finding needs a file, a useful line (or null), and reproducible evidence.
-For every open ledger finding, provide resolved/unresolved and evidence.
-Never re-raise dismissed findings. Reopen resolved findings only for a regression.
-
 nit_cap: 5
 
-Skip style preferences, speculative risks, unrelated pre-existing issues,
-formatting handled by lint, and requests to expand the agreed scope.
-Nits never block completion. The factory runs all checks independently.
-Check spec/plan examples against actual behavior; harmless artifact inaccuracies
-are nits. Distinguish a failing acceptance criterion from an optional expansion.
+An Important finding is a concrete defect that blocks acceptance: a bug, a security
+problem, or a failure to meet spec.md or plan.md. Anything else worth saying is a nit,
+and nits never block completion. Skip style preferences, speculative risks, pre-existing
+issues outside this change, and requests to expand the agreed scope.
 """
 
 
