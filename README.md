@@ -17,17 +17,45 @@ make lint
 ```sh
 factory init
 # Edit factory.toml: set auth = "subscription" for your saved login,
-# select the harness, and configure the repository's test/lint commands.
+# select harnesses for the roles, and configure the repository's test/lint commands.
 # Commit and push the generated files to the configured base_branch.
-factory doctor --harness claude --auth subscription
-factory doctor --harness codex --auth subscription
+factory doctor --auth subscription
 
 gh issue create --template intent.md
 factory run 42 --harness claude --auth subscription
 factory status 42
 ```
 
-Use the new issue's number instead of `42`. Run `factory run 42 --harness codex --auth subscription` to use Codex. Each session uses the selected CLI's default model unless configured otherwise.
+Use the new issue's number instead of `42`. Run `factory run 42 --auth subscription` to use the configured harness for each role, or add `--harness codex` to use Codex throughout the invocation.
+
+Set defaults in `[factory]` and override individual fields for any of `spec`, `plan`, `build`, `review`, or `fix`:
+
+```toml
+[factory]
+harness = "claude"
+model = ""
+effort = ""
+auth = "subscription"
+
+[roles.review]
+model = "opus"
+effort = "high"
+
+[roles.build]
+harness = "codex"
+effort = "medium"
+
+[roles.fix]
+harness = "codex"
+```
+
+Each field resolves independently: CLI flag → role setting → factory default → harness CLI default. An omitted role field inherits the factory value; an explicit empty `model` or `effort` uses the harness CLI default and passes no flag. Switching harnesses does not clear an inherited model or effort. Replace the old `[harness.claude]` and `[harness.codex]` tables with these defaults and role settings; the old tables are rejected.
+
+Effort accepts `low`, `medium`, or `high`, plus `max` for Claude. Unsupported effort values, unknown roles, and unknown harnesses fail when loading the configuration. Model names are passed through to the selected harness. Claude receives `--model` and `--effort`; Codex receives `-m` and `-c model_reasoning_effort=<level>`.
+
+`--harness`, `--model`, and `--effort` override their fields for the invocation, including all stages of `run`. For example, `factory run 42 --harness codex --model "" --effort high` uses Codex's default model at high effort. Stage, review-round, and fix-round records under `.factory/issues/42/state.json` retain the settings used; omitted model and effort flags are recorded as `CLI default`.
+
+`factory doctor` probes every distinct harness referenced by the factory defaults or any role and reports each result. It uses factory settings for the default harness and the first role in stage order that uses each additional harness. Add `--harness` to probe one harness, or `--model` and `--effort` to override probe settings. Doctor records are cached by factory version, harness, CLI version, and auth mode.
 
 Inspect `.factory/issues/42/` in the target repo root for the intent, spec, plan, check logs, prompts, state, findings ledger, and review/fix outputs. These ignored files stay on this machine; `factory/42` contains only build and fix commits. Transcripts are under `.factory/transcripts/` and the code worktree is under `.factory/worktrees/42/`. Keep `.factory/issues/` to resume runs locally; cloning the branch does not restore run state.
 
@@ -54,7 +82,10 @@ Hand code fixes must be committed inside the issue worktree. Edit spec and plan 
 Repository instructions, checks, CI, configured protected paths, and `.factory/` cannot be changed by agents; fix sessions also cannot change tests. Build reports deviations in its JSON output; only the operator may edit the saved plan.
 
 For label-based intake, set `auth = "api"` in `factory.toml`, supply the configured
-harness's API key (`ANTHROPIC_API_KEY` or `CODEX_API_KEY`), and run `factory poll`
+harnesses' API keys (`ANTHROPIC_API_KEY` for Claude and `CODEX_API_KEY` for Codex), and run `factory poll`
 from the target repository. Each invocation makes one pass over eligible issues
 with the configured intake label (`factory` by default). Poll uses `factory.toml`
 and requires API authentication; saved subscription logins are for attended runs.
+Poll refuses CLI overrides and requires a passing doctor record for every configured
+harness at its installed version and API auth mode. If any record is missing or
+failed, it runs doctor before discovering issues and stops if a probe fails.

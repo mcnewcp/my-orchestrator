@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from .checks import filtered_env
+from .config import harness_settings
+from .state import atomic_json
 
 
 FACTORY_VERSION = "0.1.0"
@@ -37,6 +39,7 @@ class Harness(Protocol):
     def run(
         self, *, cwd: Path, prompt_file: Path, schema_file: Path, mode: Mode,
         model: str | None, auth: Auth, env: dict[str, str], timeout_s: int,
+        effort: str | None = None,
     ) -> HarnessResult: ...
 
 
@@ -139,7 +142,7 @@ class _CLI:
 
     def command(self, *, prompt_file: Path, schema_file: Path, schema: dict,
                 mode: Mode, model: str | None, auth: Auth, cwd: Path,
-                last_file: Path) -> list[str]:
+                last_file: Path, effort: str | None = None) -> list[str]:
         raise NotImplementedError
 
     def parse_output(self, stdout: str, last_file: Path) -> dict:
@@ -148,6 +151,7 @@ class _CLI:
     def run(
         self, *, cwd: Path, prompt_file: Path, schema_file: Path, mode: Mode,
         model: str | None, auth: Auth, env: dict[str, str], timeout_s: int,
+        effort: str | None = None,
     ) -> HarnessResult:
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
         stem = f"{time.time_ns()}-{self.name}-{uuid4().hex[:8]}"
@@ -176,7 +180,7 @@ class _CLI:
             version = self.version()
             command = self.command(
                 prompt_file=prompt_file, schema_file=schema_file, schema=schema,
-                mode=mode, model=model, auth=auth, cwd=cwd, last_file=last_file,
+                mode=mode, model=model, effort=effort, auth=auth, cwd=cwd, last_file=last_file,
             )
             with transcript.open("wb") as out, errors.open("wb") as err:
                 process = subprocess.Popen(
@@ -222,7 +226,7 @@ class ClaudeCode(_CLI):
 
     def command(self, *, prompt_file: Path, schema_file: Path, schema: dict,
                 mode: Mode, model: str | None, auth: Auth, cwd: Path,
-                last_file: Path) -> list[str]:
+                last_file: Path, effort: str | None = None) -> list[str]:
         command = [
             "claude", "-p", f"Follow the instructions in {prompt_file} exactly.",
             "--output-format", "json", "--permission-mode", "dontAsk",
@@ -246,6 +250,8 @@ class ClaudeCode(_CLI):
             ]
         if model:
             command += ["--model", model]
+        if effort:
+            command += ["--effort", effort]
         return command
 
     def parse_output(self, stdout: str, last_file: Path) -> dict:
@@ -265,13 +271,15 @@ class Codex(_CLI):
 
     def command(self, *, prompt_file: Path, schema_file: Path, schema: dict,
                 mode: Mode, model: str | None, auth: Auth, cwd: Path,
-                last_file: Path) -> list[str]:
+                last_file: Path, effort: str | None = None) -> list[str]:
         command = [
             "codex", "exec", "--json", "-o", str(last_file), "--output-schema",
             str(schema_file), "--sandbox", "read-only" if mode == "read" else "workspace-write",
         ]
         if model:
             command += ["-m", model]
+        if effort:
+            command += ["-c", f"model_reasoning_effort={effort}"]
         command.append(f"Follow the instructions in {prompt_file} exactly.")
         return command
 
@@ -306,35 +314,21 @@ def _doctor_command(argv: list[str], cwd: Path) -> str:
 
 
 def doctor(root: Path, config: dict, harness_override: str | None = None,
-           auth_override: str | None = None) -> dict:
-    """Check tools, GitHub auth, and actual read/write permissions for one harness."""
+           auth_override: str | None = None, model_override: str | None = None,
+           effort_override: str | None = None) -> dict:
+    """Probe each configured harness and preserve per-version/auth results."""
     root = Path(root).resolve()
     factory = config.get("factory", {})
-    name = harness_override or factory.get("harness", "claude")
     auth = auth_override or factory.get("auth", "api")
-    # Fail before even calling gh when unattended authentication is unavailable.
-    filtered_env(harness=name, auth=auth, source=dict(os.environ))
-    provider_key = "ANTHROPIC_API_KEY" if name == "claude" else "CODEX_API_KEY"
-    if auth == "api" and not os.environ.get(provider_key):
-        raise RuntimeError(f"api authentication requires {provider_key}; no login fallback is allowed")
-    for binary in ("git", "gh", name):
+    selected = harness_settings(config, harness=harness_override, model=model_override, effort=effort_override)
+    # Check every provider key before any GitHub read or write.
+    for name in selected:
+        filtered_env(harness=name, auth=auth)
+    for binary in ("git", "gh"):
         if shutil.which(binary) is None:
             raise RuntimeError(f"Doctor requires {binary} on PATH")
     binary_versions = {tool: _doctor_command([tool, "--version"], root) for tool in ("git", "gh")}
     _doctor_command(["gh", "auth", "status"], root)
-    adapter = make_harness(name, root / ".factory" / "transcripts")
-    version = adapter.version()
-    settings = config.get("harness", {}).get(name, {})
-    if name == "claude":
-        numeric = re.search(r"(\d+)\.(\d+)\.(\d+)", version)
-        if numeric and tuple(map(int, numeric.groups())) < (2, 1, 259):
-            raise RuntimeError("Claude Code >= 2.1.259 is required for --permission-prompts none")
-    key = doctor_key(name, version, auth)
-    record = {
-        "factory_version": FACTORY_VERSION, "harness": name, "cli_version": version,
-        "auth": auth, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "passed": False, "warnings": [], "binaries": binary_versions,
-    }
     cache_path = root / ".factory" / "doctor.json"
     try:
         cached = json.loads(cache_path.read_text()) if cache_path.exists() else {}
@@ -342,10 +336,40 @@ def doctor(root: Path, config: dict, harness_override: str | None = None,
         cached = {}
     if not isinstance(cached, dict) or not isinstance(cached.get("records", {}), dict):
         cached = {}
-    cached.setdefault("records", {})[key] = record
-    scratch_parent = root / ".factory" / "tmp"
-    scratch_parent.mkdir(parents=True, exist_ok=True)
+    records = cached.get("records", {})
+    results = {}
+    for name, settings in selected.items():
+        record = _probe_harness(root, factory, settings, auth, binary_versions)
+        results[name] = record
+        if record["cli_version"] is not None:
+            records[doctor_key(name, record["cli_version"], auth)] = record
+        # Save after every probe, so an interruption retains completed results.
+        cached = {"factory_version": FACTORY_VERSION, "records": records,
+                  "harnesses": results, "passed": len(results) == len(selected)
+                  and all(result["passed"] for result in results.values())}
+        atomic_json(cache_path, cached)
+    return cached
+
+
+def _probe_harness(root, factory, settings, auth, binary_versions):
+    name = settings["harness"]
+    record = {
+        "factory_version": FACTORY_VERSION, "harness": name, "cli_version": None,
+        "model": settings["model"] or "CLI default", "effort": settings["effort"] or "CLI default",
+        "auth": auth, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "passed": False, "warnings": [], "binaries": binary_versions,
+    }
     try:
+        if shutil.which(name) is None:
+            raise RuntimeError(f"Doctor requires {name} on PATH")
+        adapter = make_harness(name, root / ".factory" / "transcripts")
+        version = record["cli_version"] = adapter.version()
+        if name == "claude":
+            numeric = re.search(r"(\d+)\.(\d+)\.(\d+)", version)
+            if numeric and tuple(map(int, numeric.groups())) < (2, 1, 259):
+                raise RuntimeError("Claude Code >= 2.1.259 is required for --permission-prompts none")
+        scratch_parent = root / ".factory" / "tmp"
+        scratch_parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="doctor-", dir=scratch_parent) as directory:
             scratch = Path(directory)
             _doctor_command(["git", "init", "--quiet", str(scratch)], root)
@@ -366,7 +390,7 @@ def doctor(root: Path, config: dict, harness_override: str | None = None,
             )
             before = {p.relative_to(scratch): p.read_bytes() for p in scratch.rglob("*") if p.is_file()}
             kwargs = dict(cwd=scratch, prompt_file=prompt, schema_file=schema,
-                          model=settings.get("model") or None, auth=auth,
+                          model=settings["model"] or None, effort=settings["effort"] or None, auth=auth,
                           env=dict(os.environ), timeout_s=int(factory.get("stage_timeout_min", 45) * 60))
             read = adapter.run(mode="read", **kwargs)
             after = {p.relative_to(scratch): p.read_bytes() for p in scratch.rglob("*") if p.is_file()}
@@ -382,12 +406,6 @@ def doctor(root: Path, config: dict, harness_override: str | None = None,
             if not created.is_file() or created.read_text() != nonce + "\n" or write.output.get("message") != nonce:
                 raise RuntimeError(f"Doctor write probe did not create the required file; transcript: {write.transcript_path}")
             record.update(passed=True, read_transcript=str(read.transcript_path), write_transcript=str(write.transcript_path))
-    except Exception as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         record["error"] = str(exc)
-        raise
-    finally:
-        cached.update(factory_version=FACTORY_VERSION, selected=key, passed=record["passed"])
-        temporary = cache_path.with_name(f"doctor-{uuid4().hex}.tmp")
-        temporary.write_text(json.dumps(cached, indent=2) + "\n")
-        temporary.replace(cache_path)
-    return cached
+    return record

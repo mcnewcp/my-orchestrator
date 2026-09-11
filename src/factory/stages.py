@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 from .checks import changed_paths, filtered_env, run_checks, validate_edits
+from .config import ROLES, resolve_role
 from .harness import make_harness
 from .locks import record_safe_head
 from .state import atomic_json, load_json, merge_ledger, open_important, utcnow
@@ -25,12 +26,12 @@ class NeedsHuman(RuntimeError):
 
 
 class Engine:
-    def __init__(self, repo, github, config, issue, *, harness=None, auth=None, model=None):
+    def __init__(self, repo, github, config, issue, *, harness=None, auth=None, model=None, effort=None):
         self.repo, self.github, self.config, self.issue = repo, github, config, issue
         self.options = config["factory"]
-        self.harness_name = harness or self.options["harness"]
         self.auth = auth or self.options["auth"]
-        self.model = model if model is not None else config["harness"][self.harness_name]["model"]
+        self.role_settings = {role: resolve_role(config, role, harness=harness, model=model, effort=effort)
+                              for role in ROLES}
         self.timeout = self.options["stage_timeout_min"] * 60
         self.cwd = None
         self.state = {}
@@ -185,19 +186,21 @@ class Engine:
         return path, resources / "schemas" / f"{stage}.json"
 
     def call(self, stage, number=1):
-        filtered_env(harness=self.harness_name, auth=self.auth)
-        print(f"Issue #{self.issue}: {stage} using {self.harness_name} ({self.auth})", flush=True)
+        settings = self.role_settings[stage]
+        name = settings["harness"]
+        filtered_env(harness=name, auth=self.auth)
+        print(f"Issue #{self.issue}: {stage} using {name} ({self.auth})", flush=True)
         record_safe_head(self.repo, self.issue, stage=stage)
         prompt, schema = self.prompt(stage, number)
         before = self.snapshot_dirty()
         artifacts = self.snapshot_factory()
         head = self.head()
-        adapter = make_harness(self.harness_name, self.repo.local_dir / "transcripts")
+        adapter = make_harness(name, self.repo.local_dir / "transcripts")
         try:
             result = adapter.run(cwd=self.cwd, prompt_file=prompt, schema_file=schema,
                                  mode="write" if stage in ("build", "fix") else "read",
-                                 model=self.model or None, auth=self.auth,
-                                 env=filtered_env(harness=self.harness_name, auth=self.auth), timeout_s=self.timeout)
+                                 model=settings["model"] or None, effort=settings["effort"] or None, auth=self.auth,
+                                 env=filtered_env(harness=name, auth=self.auth), timeout_s=self.timeout)
         finally:
             changed_artifacts = self.snapshot_factory()
             if artifacts != changed_artifacts:
@@ -271,12 +274,17 @@ class Engine:
                 path.write_bytes(value)
                 path.chmod(kind)
 
+    def provenance(self, stage, result):
+        settings = self.role_settings[stage]
+        return {"harness": settings["harness"], "model": settings["model"] or "CLI default",
+                "effort": settings["effort"] or "CLI default", "cli_version": result.cli_version,
+                "auth": self.auth}
+
     def record_stage(self, stage, result):
         commit = self.repo.commit(self.cwd, f"factory({self.issue}): build") if stage == "build" else self.head()
         self.clear_outcome()
         self.state["stages"][stage] = {
-            "commit": commit, "at": utcnow(), "harness": self.harness_name,
-            "model": self.model or "CLI default", "cli_version": result.cli_version, "auth": self.auth,
+            "commit": commit, "at": utcnow(), **self.provenance(stage, result),
         }
         self.save()
         self.publish()
@@ -309,7 +317,7 @@ class Engine:
             if self.state.get("spec_open_questions") and not self.state.get("spec_accepted"):
                 self.gate("open_questions")
             return
-        filtered_env(harness=self.harness_name, auth=self.auth)
+        filtered_env(harness=self.role_settings["spec"]["harness"], auth=self.auth)
         issue = self.github.issue(self.issue)
         body = issue.get("body") or ""
         now = utcnow()
@@ -319,7 +327,7 @@ class Engine:
                       "snapshot_sha256": digest, "snapshot_at": now},
             "base": {"branch": self.options["base_branch"], "sha": self.head()},
             "branch": f"factory/{self.issue}", "stages": {}, "spec_open_questions": [],
-            "spec_accepted": None, "reviews": [], "fix_rounds": 0,
+            "spec_accepted": None, "reviews": [], "fixes": [], "fix_rounds": 0,
             "pr": getattr(self, "rewound_pr", None),
             "outcome": None, "outcome_sha": None,
         }
@@ -368,7 +376,7 @@ class Engine:
         if "build" in self.state["stages"]:
             self.publish()
             return
-        filtered_env(harness=self.harness_name, auth=self.auth)
+        filtered_env(harness=self.role_settings["build"]["harness"], auth=self.auth)
         before = self.snapshot_dirty()
         passed = self.check("baseline", 1)
         # Baseline checks may create caches, but must not change source or policy.
@@ -407,8 +415,8 @@ class Engine:
         after_fix = self.state["fix_rounds"] > previous_fixes
         self.state["reviews"].append({
             "round": number, "sha": reviewed, "reviewed_input_sha": reviewed,
-            "fix_rounds": self.state["fix_rounds"], "at": utcnow(), "harness": self.harness_name,
-            "model": self.model or "CLI default", "cli_version": result.cli_version, "auth": self.auth, **stats,
+            "fix_rounds": self.state["fix_rounds"], "at": utcnow(),
+            **self.provenance("review", result), **stats,
         })
         self.clear_outcome()
         reason = None
@@ -455,7 +463,10 @@ class Engine:
         atomic_json(self.work / f"fix-{number}.json", result.output)
         self.state["fix_rounds"] = number
         self.clear_outcome()
-        self.repo.commit(self.cwd, f"factory({self.issue}): fix {number} (claims await review)")
+        commit = self.repo.commit(self.cwd, f"factory({self.issue}): fix {number} (claims await review)")
+        self.state.setdefault("fixes", []).append({
+            "round": number, "commit": commit, "at": utcnow(), **self.provenance("fix", result),
+        })
         self.save()
         self.publish()
 
@@ -490,7 +501,8 @@ class Engine:
         summary = (f"Factory completed #{self.issue}.\n\n"
                    + self.render_documents() + "\n\n"
                    + self.render_ledger() + "\n\nHarness provenance:\n```json\n"
-                   + json.dumps({"stages": self.state["stages"], "reviews": self.state["reviews"]}, indent=2) + "\n```")
+                   + json.dumps({"stages": self.state["stages"], "reviews": self.state["reviews"],
+                                 "fixes": self.state.get("fixes", [])}, indent=2) + "\n```")
         self.github.comment(pr, summary, f"factory:finalize:{self.head()}")
         self.github.ready(pr)
         self.state.update(outcome="done", outcome_sha=self.head())
@@ -531,7 +543,7 @@ class Engine:
         self.rewound_pr = old.get("pr")
         stages = ("spec", "plan", "build")
         self.state["stages"] = {name: old["stages"][name] for name in stages[:stages.index(stage)]}
-        self.state.update(reviews=[], fix_rounds=0)
+        self.state.update(reviews=[], fixes=[], fix_rounds=0)
         self.state.pop("build_summary", None)
         self.clear_outcome()
         self.force_push = True

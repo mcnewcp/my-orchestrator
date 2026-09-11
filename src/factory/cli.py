@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import TEMPLATE, load_config
+from .config import EFFORTS, TEMPLATE, load_config
 from .gh import GitHub
 from .harness import doctor
 from .locks import file_lock, issue_lock
@@ -49,6 +49,7 @@ def parser():
     common.add_argument("--harness", choices=("claude", "codex"), default=argparse.SUPPRESS)
     common.add_argument("--auth", choices=("subscription", "api"), default=argparse.SUPPRESS)
     common.add_argument("--model", default=argparse.SUPPRESS)
+    common.add_argument("--effort", choices=EFFORTS, default=argparse.SUPPRESS)
     common.add_argument("--force", action="store_true", default=argparse.SUPPRESS)
     result = argparse.ArgumentParser(prog="factory", parents=[common], description="Turn one GitHub issue into a PR for human review.")
     result.add_argument("--version", action="version", version=__version__)
@@ -109,9 +110,9 @@ def status(repo, issue):
 
 
 def execute_issue(repo, github, config, issue, command="run", *, harness=None, auth=None,
-                  model=None, force=False, finding=None, reason=None):
+                  model=None, effort=None, force=False, finding=None, reason=None):
     with issue_lock(repo, issue, command):
-        engine = Engine(repo, github, config, issue, harness=harness, auth=auth, model=model)
+        engine = Engine(repo, github, config, issue, harness=harness, auth=auth, model=model, effort=effort)
         engine.prepare(create=True)
         if command == "abandon":
             # Deliberate ordering: discovery stops first, then PR, then Git state.
@@ -139,7 +140,7 @@ def execute_issue(repo, github, config, issue, command="run", *, harness=None, a
 
 def main(argv=None):
     args = parser().parse_args(argv)
-    overrides = {key: getattr(args, key) for key in ("harness", "auth", "model", "force") if hasattr(args, key)}
+    overrides = {key: getattr(args, key) for key in ("harness", "auth", "model", "effort", "force") if hasattr(args, key)}
     if args.command == "poll" and overrides:
         print("factory poll accepts no overrides; edit factory.toml", file=sys.stderr)
         return 1
@@ -155,10 +156,10 @@ def main(argv=None):
             init(repo, github)
             return 0
         if args.command == "doctor":
-            if "model" in overrides:
-                config["harness"][overrides.get("harness", config["factory"]["harness"])]["model"] = overrides["model"]
             with file_lock(repo.local_dir / "run" / "harness.lock"):
-                result = doctor(repo.root, config, harness_override=overrides.get("harness"), auth_override=overrides.get("auth"))
+                result = doctor(repo.root, config, harness_override=overrides.get("harness"),
+                                auth_override=overrides.get("auth"), model_override=overrides.get("model"),
+                                effort_override=overrides.get("effort"))
             print(json.dumps(result, indent=2))
             return 0 if result["passed"] else 1
         if args.command == "status":
