@@ -1,13 +1,18 @@
 """Exercise real subprocess boundaries with local fake CLI executables."""
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from factory.cli import main
+from factory.config import load_config
 from factory.harness import doctor, doctor_key, make_harness, validate_schema
 
 
@@ -108,7 +113,7 @@ class HarnessTests(unittest.TestCase):
 
     def run_harness(self, name="claude", **overrides):
         values = dict(cwd=self.cwd, prompt_file=self.prompt, schema_file=self.schema,
-                      mode="read", model="test-model", auth="subscription",
+                      mode="read", model="test-model", effort="high", auth="subscription",
                       env=self.source, timeout_s=5)
         values.update(overrides)
         return make_harness(name, self.transcripts, max_turns=7).run(**values)
@@ -141,11 +146,13 @@ class HarnessTests(unittest.TestCase):
                             self.assertEqual("Bash(python *)" in allowed, mode == "write")
                             self.assertNotIn("CODEX_HOME", env)
                             self.assertEqual(args[args.index("--model") + 1], "test-model")
+                            self.assertEqual(args[args.index("--effort") + 1], "high")
                         else:
                             self.assertEqual(args[args.index("--sandbox") + 1], "read-only" if mode == "read" else "workspace-write")
                             self.assertEqual(args[args.index("--output-schema") + 1], str(self.schema.resolve()))
                             self.assertNotIn("CLAUDE_CONFIG_DIR", env)
                             self.assertEqual(args[args.index("-m") + 1], "test-model")
+                            self.assertEqual(args[args.index("-c") + 1], "model_reasoning_effort=high")
                         for forbidden in ("--full-auto", "--dangerously-bypass-approvals-and-sandbox", "bypassPermissions"):
                             self.assertNotIn(forbidden, args)
 
@@ -253,6 +260,89 @@ class HarnessTests(unittest.TestCase):
         del os.environ["ANTHROPIC_API_KEY"]
         with self.assertRaisesRegex((RuntimeError, ValueError), "ANTHROPIC_API_KEY"):
             doctor(self.cwd, {})
+        self.assertEqual(self.calls(), [])
+
+    def test_doctor_probes_both_harnesses_once_with_resolved_settings(self):
+        self.settings(doctor=True)
+        (self.cwd / "factory.toml").write_text('''[factory]
+auth = "subscription"
+model = "factory-model"
+effort = "medium"
+[roles.build]
+harness = "codex"
+model = "build-model"
+effort = "high"
+[roles.fix]
+harness = "codex"
+''')
+        config = load_config(self.cwd)
+        result = doctor(self.cwd, config)
+        self.assertTrue(result["passed"])
+        self.assertEqual(set(result["harnesses"]), {"claude", "codex"})
+        self.assertEqual(len(result["records"]), 2)
+        for name, model, effort in (("claude", "factory-model", "medium"), ("codex", "build-model", "high")):
+            record = result["harnesses"][name]
+            self.assertTrue(record["passed"])
+            self.assertEqual((record["model"], record["effort"]), (model, effort))
+            calls = [call["args"] for call in self.calls() if call["name"] == name and "--version" not in call["args"]]
+            self.assertEqual(len(calls), 2)
+            for args in calls:
+                model_flag, effort_flag = ("--model", "--effort") if name == "claude" else ("-m", "-c")
+                self.assertEqual(args[args.index(model_flag) + 1], model)
+                self.assertEqual(args[args.index(effort_flag) + 1], effort if name == "claude" else f"model_reasoning_effort={effort}")
+        # The configured default harness is probed even if every role overrides it.
+        for role in config["roles"].values():
+            role["harness"] = "codex"
+        self.assertEqual(set(doctor(self.cwd, config)["harnesses"]), {"claude", "codex"})
+
+    def test_doctor_reports_failure_and_continues_other_harness_probes(self):
+        self.settings(doctor=True, versions={"claude": "2.1.0 (Claude Code)"})
+        config = {"factory": {"auth": "subscription"}, "roles": {"build": {"harness": "codex"}}}
+        result = doctor(self.cwd, config)
+        self.assertFalse(result["passed"])
+        self.assertIn("Claude Code >=", result["harnesses"]["claude"]["error"])
+        self.assertTrue(result["harnesses"]["codex"]["passed"])
+        cache = json.loads((self.cwd / ".factory/doctor.json").read_text())
+        self.assertEqual(cache, result)
+        self.assertFalse(cache["records"][doctor_key("claude", "2.1.0 (Claude Code)", "subscription")]["passed"])
+        # A missing binary is also a per-harness failure, with no fabricated version.
+        (self.bin / "claude").unlink()
+        with patch("factory.harness.shutil.which", side_effect=lambda name: None if name == "claude" else str(self.bin / name)):
+            result = doctor(self.cwd, config)
+        self.assertIsNone(result["harnesses"]["claude"]["cli_version"])
+        self.assertIn("requires claude", result["harnesses"]["claude"]["error"])
+        self.assertTrue(result["harnesses"]["codex"]["passed"])
+
+    def test_doctor_cli_overrides_select_harness_model_effort_and_auth(self):
+        self.settings(doctor=True)
+        (self.cwd / "factory.toml").write_text('''[factory]
+model = "configured-model"
+effort = "high"
+[roles.build]
+harness = "codex"
+''')
+        repo = SimpleNamespace(root=self.cwd, local_dir=self.cwd / ".factory")
+        for flags, expected in ((["--effort", "low"], {"claude", "codex"}),
+                                (["--harness", "codex", "--model", "", "--effort", ""], {"codex"})):
+            with patch("factory.cli.Repo", return_value=repo), patch("factory.cli.GitHub"), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(main(["doctor", "--auth", "subscription", *flags]), 0)
+            result = json.loads(output.getvalue())
+            self.assertEqual(set(result["harnesses"]), expected)
+            for record in result["harnesses"].values():
+                self.assertEqual(record["auth"], "subscription")
+                self.assertEqual(record["effort"], "low" if len(expected) == 2 else "CLI default")
+                self.assertEqual(record["model"], "configured-model" if len(expected) == 2 else "CLI default")
+        last_calls = [call["args"] for call in self.calls() if call["name"] == "codex" and "--version" not in call["args"]][-2:]
+        for args in last_calls:
+            self.assertNotIn("-m", args)
+            self.assertNotIn("-c", args)
+
+    def test_doctor_requires_second_provider_key_before_any_cli_call(self):
+        del os.environ["CODEX_API_KEY"]
+        config = {"roles": {"build": {"harness": "codex"}}}
+        with self.assertRaisesRegex(ValueError, "CODEX_API_KEY"):
+            doctor(self.cwd, config)
         self.assertEqual(self.calls(), [])
 
 

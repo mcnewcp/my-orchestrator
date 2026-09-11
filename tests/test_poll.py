@@ -300,6 +300,46 @@ class PollTests(unittest.TestCase):
         self.assertEqual(self.github.calls, [])
         self.execute.assert_not_called()
 
+    def test_two_harness_poll_requires_current_passing_records_for_both(self):
+        self.config["roles"]["build"] = {"harness": "codex"}
+        self.config["roles"]["fix"] = {"harness": "codex"}
+        codex_key = doctor_key("codex", VERSION, "api")
+        self.github.numbers = [42]
+        with patch.dict(os.environ, {"CODEX_API_KEY": "fake-codex"}):
+            for record in (None, {"passed": False}, {"passed": True}):
+                with self.subTest(record=record):
+                    records = {self.key: {"passed": True}}
+                    if record is not None:
+                        records[codex_key] = record
+                    atomic_json(self.repo.local_dir / "doctor.json", {"records": records})
+                    self.doctor.reset_mock()
+                    self.execute.reset_mock()
+                    self.github.calls.clear()
+                    self.harness.reset_mock()
+                    self.doctor.return_value = {"passed": False}
+                    if record and record["passed"]:
+                        self.assertEqual(self.run_poll(), 0)
+                        self.assertEqual(self.github.calls, ["factory"])
+                        self.execute.assert_called_once()
+                        self.doctor.assert_not_called()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "doctor failed"):
+                            self.run_poll()
+                        self.assertEqual(self.github.calls, [])
+                        self.execute.assert_not_called()
+                        self.doctor.assert_called_once()
+                    self.assertEqual([call.args[0] for call in self.harness.call_args_list], ["claude", "codex"])
+
+    def test_second_harness_missing_key_stops_before_discovery_and_probes(self):
+        self.config["roles"]["review"] = {"harness": "codex"}
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "fake-key"}, clear=True), \
+                self.assertRaisesRegex(ValueError, "CODEX_API_KEY"):
+            self.run_poll()
+        self.assertEqual(self.github.calls, [])
+        self.harness.assert_not_called()
+        self.doctor.assert_not_called()
+        self.execute.assert_not_called()
+
     def test_retry_counts_use_final_head_and_success_or_human_gate_clears(self):
         self.github.numbers = [1, 2, 3]
         for issue in self.github.numbers:
