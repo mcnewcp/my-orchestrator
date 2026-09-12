@@ -1,5 +1,6 @@
 """One-shot unattended discovery; all workflow decisions remain local."""
 
+from . import present
 from .checks import filtered_env
 from .config import harness_settings
 from .harness import doctor, doctor_key, make_harness
@@ -37,7 +38,7 @@ def poll(repo, github, config):
         filtered_env(harness=name, auth="api")  # Before any GitHub read or write.
     with file_lock(repo.local_dir / "run" / "poll.lock", skip=True) as acquired:
         if not acquired:
-            print("Another poll is running; skipping.")
+            present.poll_busy()
             return 0
         # Include a first-time doctor in the poll lock. Two fresh poll processes
         # must not race the probe or contend for the shared harness lock.
@@ -77,15 +78,15 @@ def poll(repo, github, config):
                                        if repo.branch_exists(issue, remote=True) else None)
                         if remote_head != head:
                             if _capped(failures, issue, head, limit):
-                                print(f"Issue #{issue}: skip consecutive failure cap at {head}")
+                                present.poll_skip_capped(issue, head)
                                 continue
                             repo.push(issue)
                             if failures.pop(issue_key, None) is not None:
                                 atomic_json(failures_path, failures)
-                        print(f"Issue #{issue}: skip done")
+                        present.poll_skip_done(issue)
                         continue
                     if _capped(failures, issue, head, limit):
-                        print(f"Issue #{issue}: skip consecutive failure cap at {head}")
+                        present.poll_skip_capped(issue, head)
                         continue
                     if outcome.startswith("needs_human:") and head == repo.resolve(cwd, state["outcome_sha"]):
                         previous = failures.get(issue_key, {})
@@ -94,21 +95,21 @@ def poll(repo, github, config):
                         remote_head = (repo.git("rev-parse", f"refs/remotes/origin/factory/{issue}")
                                        if repo.branch_exists(issue, remote=True) else None)
                         if not publication_failed and not notice_pending and remote_head == head:
-                            print(f"Issue #{issue}: skip {outcome}")
+                            present.poll_skip_parked(issue, outcome)
                             continue
                         # A gate is saved before its push/comment. Replaying
                         # run at that same SHA retries idempotent publication
                         # and exits 2 without launching a model session.
-                        print(f"Issue #{issue}: retry pending gate publication")
+                        present.poll_retry_gate(issue)
                 code = execute_issue(repo, github, config, issue)
             except (RuntimeError, ValueError, OSError, KeyError, TypeError) as exc:
                 head = _current_head(repo, issue, head)
                 # A persistent preparation failure (for example divergence)
                 # is bounded at the same local HEAD as a failed stage.
                 if _capped(failures, issue, head, limit):
-                    print(f"Issue #{issue}: skip consecutive failure cap at {head}")
+                    present.poll_skip_capped(issue, head)
                     continue
-                print(f"Issue #{issue}: failed: {exc}")
+                present.poll_failed(issue, exc)
                 code = 1
             if code == 1:
                 failed = True

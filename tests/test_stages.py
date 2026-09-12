@@ -1,5 +1,6 @@
 """Stage integration tests with real local Git and fake harness/GitHub adapters."""
 
+import ast
 import copy
 import contextlib
 import io
@@ -12,9 +13,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import factory
 from factory.cli import REVIEW, execute_issue, main, status
 from factory.config import DEFAULTS, load_config
-from factory.harness import HarnessResult
+from factory.harness import HarnessError, HarnessResult
 from factory.repo import Repo
 from factory.stages import Engine, NeedsHuman
 from factory.state import atomic_json, load_json, open_important
@@ -137,6 +139,19 @@ class StageTests(unittest.TestCase):
         harness_patch.start()
         self.addCleanup(harness_patch.stop)
         self.engine = Engine(self.repo, self.github, self.config, 42).prepare()
+
+    def cli(self, *argv, code=0, errors=None):
+        """Drive the CLI exactly as a terminal does: main(argv), captured stdout."""
+        (self.root / "factory.toml").write_text(
+            '[factory]\nauth = "subscription"\nchecks = '
+            + json.dumps(self.config["factory"]["checks"]) + "\n")
+        output = io.StringIO()
+        with patch("factory.cli.Path.cwd", return_value=self.root), \
+                patch("factory.cli.GitHub", return_value=self.github), \
+                contextlib.redirect_stdout(output), \
+                contextlib.redirect_stderr(errors if errors is not None else io.StringIO()):
+            self.assertEqual(main(list(argv)), code)
+        return output.getvalue()
 
     def git(self, *args, cwd=None):
         result = subprocess.run(["git", *args], cwd=cwd or self.root, check=True,
@@ -747,14 +762,139 @@ harness = "codex"
                     self.repo.git("worktree", "remove", str(self.engine.cwd))
                 elif remove == "branch":
                     self.repo.git("branch", "-D", "factory/42")
-                output = io.StringIO()
-                with patch.object(self.repo, "fetch", side_effect=AssertionError("status must not fetch")), \
-                        contextlib.redirect_stdout(output):
+                output, readable = io.StringIO(), io.StringIO()
+                no_fetch = patch.object(self.repo, "fetch", side_effect=AssertionError("status must not fetch"))
+                with no_fetch, contextlib.redirect_stdout(output):
+                    self.assertEqual(status(self.repo, 42, as_json=True), 0)
+                with no_fetch, contextlib.redirect_stdout(readable):
                     self.assertEqual(status(self.repo, 42), 0)
                 report = json.loads(output.getvalue())
                 self.assertEqual(report["state"], saved)
                 self.assertEqual(report["worktree"], str(self.engine.cwd) if remove is None else None)
                 self.assertEqual(report["head"] is None, remove == "branch")
+                self.assertIn("Issue #42: Implement value", readable.getvalue())
+                self.assertIn("Local state only; status does not fetch.", readable.getvalue())
+
+    def test_run_prints_stage_progress_and_the_completed_run_locations(self):
+        self.adapter.reviews = [review(finding()), review(updates=[update("F1")])]
+        output = self.cli("run", "42", "--model", "opus", "--effort", "high")
+        self.assertIn("Issue #42: spec start (claude, model opus, effort high, subscription auth)", output)
+        self.assertRegex(output, r"Issue #42: spec done in [\d.]+s \(claude, model opus, effort high\)")
+        self.assertIn("Issue #42: baseline checks start", output)
+        self.assertIn("Issue #42: baseline checks passed in ", output)
+        self.assertIn("Issue #42: review 2 start (claude, model opus, effort high, subscription auth)", output)
+        self.assertIn("Issue #42: fix 1 checks passed in ", output)
+        self.assertIn("Issue #42: run complete in ", output)
+        self.assertIn("  PR: https://example.invalid/pull/142", output)
+        self.assertIn(f"  Artifacts: {self.engine.work}/", output)
+        self.assertIn(f"  Transcripts: {self.repo.local_dir / 'transcripts'}/", output)
+
+    def test_open_questions_gate_prints_the_reason_and_the_next_command(self):
+        self.adapter.open_questions = ["What value is required?"]
+        output = self.cli("run", "42", code=2)
+        # No --model/--effort: the unset settings must still read as "default".
+        self.assertIn("Issue #42: spec start (claude, model default, effort default, subscription auth)", output)
+        self.assertRegex(output, r"Issue #42: spec done in [\d.]+s \(claude, model default, effort default\)")
+        self.assertIn("Issue #42 needs human input: open_questions", output)
+        self.assertIn("The spec asks questions only you can answer.", output)
+        self.assertIn("Next: Resolve .factory/issues/42/spec.md, then run factory accept 42.", output)
+        parked = self.cli("status", "42")
+        self.assertIn("Next: needs human input (open_questions).", parked)
+        self.assertIn("Resolve .factory/issues/42/spec.md, then run factory accept 42.", parked)
+        # A hand commit retires the gates a commit resolves, but not this one: the
+        # engine re-raises it from the spec answers, so status must keep saying accept.
+        self.operator_commit()
+        still_parked = self.cli("status", "42")
+        self.assertIn("Next: needs human input (open_questions).", still_parked)
+        self.assertNotIn("HEAD has moved", still_parked)
+        self.assertIn("Issue #42 needs human input: open_questions", self.cli("run", "42", code=2))
+
+    def test_failed_checks_and_harness_calls_report_their_output_paths(self):
+        self.adapter.mutations["build"] = lambda cwd: (cwd / "src/value.py").write_text("VALUE = -1\n")
+        errors = io.StringIO()
+        output = self.cli("run", "42", code=1, errors=errors)
+        self.assertIn("Issue #42: build checks failed in ", output)
+        self.assertIn(f"\n  check log: {self.engine.work / 'checks/build-1.log'}\n", output)
+        self.assertIn("factory: build checks failed\n", errors.getvalue())
+
+        transcript = self.repo.local_dir / "transcripts/run.json"
+        log = self.repo.local_dir / "transcripts/run.stderr.log"
+
+        def fail(**kwargs):
+            raise HarnessError("claude exited 9", transcript, log)
+
+        self.adapter.run = fail
+        errors = io.StringIO()
+        output = self.cli("run", "42", code=1, errors=errors)
+        self.assertIn("Issue #42: build failed after ", output)
+        self.assertNotIn("Issue #42: build done", output)
+        self.assertIn("factory: claude exited 9\n", errors.getvalue())
+        self.assertIn(f"\n  transcript: {transcript}\n", errors.getvalue())
+        self.assertIn(f"\n  stderr: {log}\n", errors.getvalue())
+
+    def test_status_summarises_progress_findings_and_the_next_action(self):
+        self.through_review(finding())
+        output = self.cli("status", "42")
+        self.assertIn("Issue #42: Implement value", output)
+        self.assertRegex(output, r"spec\s+done ")
+        self.assertRegex(output, r"build\s+done .*claude, model default, effort default")
+        self.assertRegex(output, r"review\s+1 round")
+        self.assertIn("PR: https://example.invalid/pull/142", output)
+        self.assertIn("F1  important  Missing input guard", output)
+        self.assertIn("Next: run factory run 42.", output)
+        self.assertIn(f"  Artifacts: {self.engine.work}/", output)
+        # Only open findings are listed; a dismissed one no longer blocks the run.
+        self.cli("dismiss", "42", "F1", "Accepted limitation.")
+        dismissed = self.cli("status", "42")
+        self.assertIn("Open findings: none", dismissed)
+        self.assertNotIn("F1", dismissed)
+
+    def test_status_stops_quoting_an_outcome_that_head_has_moved_past(self):
+        self.adapter.reviews = [review(finding()), review(updates=[update("F1", "unresolved")])]
+        self.cli("run", "42", code=2)
+        self.assertIn("Next: needs human input (no_progress).", self.cli("status", "42"))
+        self.operator_commit()
+        answered = self.cli("status", "42")
+        self.assertIn("Next: run factory run 42.", answered)
+        self.assertIn("The no_progress gate was recorded at an earlier commit", answered)
+        # The engine agrees the gate no longer holds: the run carries on from HEAD.
+        self.adapter.reviews = [review(updates=[update("F1")])]
+        self.assertIn("Issue #42: run complete in ", self.cli("run", "42"))
+        self.assertIn("Next: nothing; the PR is ready for human review.", self.cli("status", "42"))
+        # The mirror case: a commit after completion is one factory will not finalize.
+        self.operator_commit(text="# Second operator correction\n")
+        moved = self.cli("status", "42")
+        self.assertNotIn("the PR is ready for human review", moved)
+        self.assertIn("Next: review the new commit before factory can finish.", moved)
+        self.assertIn("Run factory review 42, then factory run 42.", moved)
+        errors = io.StringIO()
+        self.cli("run", "42", code=1, errors=errors)
+        self.assertIn("HEAD changed after completion", errors.getvalue())
+
+    def test_status_json_still_prints_the_raw_local_state(self):
+        self.through_review(finding())
+        report = json.loads(self.cli("status", "42", "--json"))
+        self.assertEqual(report["issue"], 42)
+        self.assertEqual(report["state"], load_json(self.engine.work / "state.json"))
+        self.assertEqual(sorted(report), ["head", "in_flight", "issue", "note", "state", "worktree"])
+
+    def test_status_reports_a_run_in_flight_before_the_first_stage_saves_state(self):
+        marker = self.repo.local_dir / "run" / "42.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json(marker, {"stage": "spec", "pid": os.getpid(), "started_at": "2026-01-01T00:00:00Z"})
+        self.assertFalse((self.engine.work / "state.json").exists())
+        output = self.cli("status", "42")
+        self.assertIn("Issue #42: no local run state.", output)
+        self.assertIn("A run holds this issue: spec, pid ", output)
+
+    def test_only_the_presenter_prints(self):
+        package = Path(factory.__file__).parent
+        printers = sorted(
+            path.name for path in package.glob("*.py")
+            if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "print"
+                   for node in ast.walk(ast.parse(path.read_text())))
+        )
+        self.assertEqual(printers, ["present.py"])
 
     def test_dismiss_uses_saved_ledger_without_committing(self):
         self.through_review(finding())

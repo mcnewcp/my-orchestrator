@@ -3,10 +3,9 @@
 import argparse
 import json
 import subprocess
-import sys
 from pathlib import Path
 
-from . import __version__
+from . import __version__, present
 from .config import EFFORTS, TEMPLATE, load_config
 from .gh import GitHub
 from .harness import doctor
@@ -55,6 +54,9 @@ def parser():
         if name == "dismiss":
             command.add_argument("finding")
             command.add_argument("reason")
+        if name == "status":
+            command.add_argument("--json", action="store_true", dest="as_json",
+                                 help="print the raw local state instead of a readable summary")
     return result
 
 
@@ -78,16 +80,16 @@ def init(repo, github):
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content)
-            print(f"Created {name}")
+            present.created(name)
     ignore = repo.root / ".gitignore"
     contents = ignore.read_text() if ignore.exists() else ""
     if not any(line.strip() in (".factory/", "/.factory/", ".factory", "/.factory") for line in contents.splitlines()):
         ignore.write_text(contents.rstrip("\n") + "\n.factory/\n")
     github.ensure_label(label)
-    print("Initialized. Configure checks and auth in factory.toml, then commit and push these files to the base branch.")
+    present.initialized()
 
 
-def status(repo, issue):
+def status(repo, issue, *, as_json=False):
     state = load_json(repo.issue_dir(issue) / "state.json", {})
     cwd = repo.worktree(issue, create=False)
     if cwd:
@@ -96,15 +98,22 @@ def status(repo, issue):
         head = repo.git("rev-parse", f"refs/heads/factory/{issue}")
     else:
         head = None
-    print(json.dumps({"issue": issue, "head": head, "worktree": str(cwd) if cwd else None,
-                      "state": state, "in_flight": load_json(repo.local_dir / "run" / f"{issue}.json"),
-                      "note": "Local state only; status does not fetch."}, indent=2))
+    report = {"issue": issue, "head": head, "worktree": str(cwd) if cwd else None,
+              "state": state, "in_flight": load_json(repo.local_dir / "run" / f"{issue}.json"),
+              "note": present.LOCAL_ONLY_NOTE}
+    if as_json:
+        present.json_document(report)
+    else:
+        present.status_summary(report, load_json(repo.issue_dir(issue) / "findings.json", {"findings": []}),
+                               artifacts=repo.issue_dir(issue),
+                               transcripts=repo.local_dir / "transcripts")
     return 0
 
 
 def execute_issue(repo, github, config, issue, command="run", *, harness=None, auth=None,
                   model=None, effort=None, force=False, finding=None, reason=None):
     with issue_lock(repo, issue, command):
+        elapsed = present.timer()
         engine = Engine(repo, github, config, issue, harness=harness, auth=auth, model=model, effort=effort)
         engine.prepare(create=True)
         if command == "abandon":
@@ -122,12 +131,14 @@ def execute_issue(repo, github, config, issue, command="run", *, harness=None, a
             else:
                 getattr(engine, command)()
         except NeedsHuman as exc:
-            print(f"Issue #{issue} needs human input: {exc}")
+            present.gate(issue, exc.reason, exc.guidance)
             return 2
         except BaseException:
             engine.rollback()
             raise
-        print(f"Issue #{issue}: {command} complete" + (f" — {engine.state['pr']['url']}" if engine.state.get("pr") else ""))
+        present.completed(issue, command, pr_url=(engine.state.get("pr") or {}).get("url"),
+                          artifacts=engine.work, transcripts=repo.local_dir / "transcripts",
+                          seconds=elapsed())
         return 0
 
 
@@ -135,10 +146,10 @@ def main(argv=None):
     args = parser().parse_args(argv)
     overrides = {key: getattr(args, key) for key in ("harness", "auth", "model", "effort", "force") if hasattr(args, key)}
     if args.command == "poll" and overrides:
-        print("factory poll accepts no overrides; edit factory.toml", file=sys.stderr)
+        present.poll_overrides_rejected()
         return 1
     if overrides.get("force") and args.command not in ("spec", "plan", "build"):
-        print("--force is supported only on spec, plan, and build", file=sys.stderr)
+        present.force_unsupported()
         return 1
     try:
         repo = Repo(Path.cwd())
@@ -153,20 +164,20 @@ def main(argv=None):
                 result = doctor(repo.root, config, harness_override=overrides.get("harness"),
                                 auth_override=overrides.get("auth"), model_override=overrides.get("model"),
                                 effort_override=overrides.get("effort"))
-            print(json.dumps(result, indent=2))
+            present.json_document(result)
             return 0 if result["passed"] else 1
         if args.command == "status":
-            return status(repo, args.issue)
+            return status(repo, args.issue, as_json=args.as_json)
         if args.command == "poll":
             from .poll import poll
             return poll(repo, github, config)
         return execute_issue(repo, github, config, args.issue, args.command, **overrides,
                              finding=getattr(args, "finding", None), reason=getattr(args, "reason", None))
     except (RuntimeError, ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as exc:
-        print(f"factory: {exc}", file=sys.stderr)
+        present.failure(exc)
         return 1
     except KeyboardInterrupt:
-        print("factory: interrupted; rerun the same command", file=sys.stderr)
+        present.interrupted()
         return 1
 
 

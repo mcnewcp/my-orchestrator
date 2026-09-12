@@ -23,7 +23,7 @@ factory doctor --auth subscription
 
 gh issue create --template intent.md
 factory run 42 --harness claude --auth subscription
-factory status 42
+factory status 42          # readable summary; add --json for the raw state
 ```
 
 Use the new issue's number instead of `42`. Run `factory run 42 --auth subscription` to use the configured harness for each role, or add `--harness codex` to use Codex throughout the invocation.
@@ -61,7 +61,36 @@ Inspect `.factory/issues/42/` in the target repo root for the intent, spec, plan
 
 The draft PR is opened after build produces code changes. Its body and the final summary comment include the spec and plan in collapsed sections. Before build, gates are reported locally by the CLI and `factory status`.
 
-Exit `0` means complete, `1` means failure (correct it and retry), and `2` means human input is needed. An unchanged parked run makes no model calls.
+## Reading the output
+
+`factory run` prints one line when a stage starts and one when it finishes, and the same for each check run. Review and fix lines carry their round number:
+
+```text
+Issue #42: build start (codex, model default, effort medium, subscription auth)
+Issue #42: build done in 3m07s (codex, model default, effort medium)
+Issue #42: build checks start
+Issue #42: build checks passed in 42.6s
+Issue #42: review 2 start (claude, model opus, effort high, subscription auth)
+Issue #42: review 2 done in 1m14s (claude, model opus, effort high)
+Issue #42: run complete in 12m04s
+  PR: https://github.com/you/repo/pull/7
+  Artifacts: /home/you/repo/.factory/issues/42/
+  Transcripts: /home/you/repo/.factory/transcripts/
+```
+
+`model default` and `effort default` mean the harness CLI default was used; `state.json` records the same fact as `CLI default`. A gate prints what stopped the run and the exact next command:
+
+```text
+Issue #42 needs human input: open_questions
+  The spec asks questions only you can answer.
+  Next: Resolve .factory/issues/42/spec.md, then run factory accept 42.
+```
+
+A failed check prints its log path, and a failed stage prints how long it ran before dying; its harness transcript and stderr paths follow the error on stderr, each on its own line.
+
+`factory status 42` prints a readable summary: stage progress, the branch, worktree, artifact and transcript locations, the PR link, open findings (id, severity, title), and the next action. `factory status 42 --json` prints the raw local state document, unchanged, for scripts.
+
+Exit `0` means complete, `1` means failure (correct it and retry), and `2` means human input is needed. A failure prints `factory: <what failed>` on stderr, followed by the harness transcript and stderr paths when a model session produced them. An unchanged parked run makes no model calls.
 
 ```sh
 # Resolve a spec gate:

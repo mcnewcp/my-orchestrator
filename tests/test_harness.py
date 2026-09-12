@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from factory.cli import main
 from factory.config import load_config
-from factory.harness import doctor, doctor_key, make_harness, validate_schema
+from factory.harness import HarnessError, doctor, doctor_key, make_harness, validate_schema
 
 
 FAKE_CLI = r'''#!/usr/bin/env python3
@@ -184,10 +184,17 @@ class HarnessTests(unittest.TestCase):
 
     def test_failure_retains_both_streams(self):
         self.settings(exit_code=9, stderr="rate limited")
-        with self.assertRaisesRegex(RuntimeError, "exited 9.*transcript:"):
+        with self.assertRaises(HarnessError) as caught:
             self.run_harness()
-        self.assertIn("failed stdout", next(self.transcripts.glob("*.json")).read_text())
-        self.assertIn("rate limited", next(self.transcripts.glob("*.stderr.log")).read_text())
+        self.assertRegex(str(caught.exception), "exited 9.*transcript:")
+        transcript = next(self.transcripts.glob("*.json"))
+        errors = next(self.transcripts.glob("*.stderr.log"))
+        # The paths travel as attributes, not only inside the message, so the
+        # presenter can print each of them on its own line.
+        self.assertEqual(caught.exception.transcript, transcript)
+        self.assertEqual(caught.exception.stderr_log, errors)
+        self.assertIn("failed stdout", transcript.read_text())
+        self.assertIn("rate limited", errors.read_text())
 
     def test_timeout_terminates_descendants_and_keeps_partial_output(self):
         self.settings(sleep=90, child=True)

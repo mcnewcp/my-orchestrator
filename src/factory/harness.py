@@ -33,6 +33,16 @@ class HarnessResult:
     cli_version: str
 
 
+class HarnessError(RuntimeError):
+    """A harness failure that carries its transcript and stderr log paths."""
+
+    def __init__(self, summary: object, transcript: Path, stderr_log: Path):
+        self.summary = str(summary)
+        self.transcript = Path(transcript)
+        self.stderr_log = Path(stderr_log)
+        super().__init__(f"{self.summary}; transcript: {self.transcript}; stderr: {self.stderr_log}")
+
+
 class Harness(Protocol):
     def version(self) -> str: ...
 
@@ -203,7 +213,7 @@ class _CLI:
             validate_schema(output, schema)
             return HarnessResult(output, transcript, code, version)
         except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
-            raise RuntimeError(f"{exc}; transcript: {transcript}; stderr: {errors}") from exc
+            raise HarnessError(exc, transcript, errors) from exc
 
     @staticmethod
     def _stop_group(process: subprocess.Popen) -> None:

@@ -6,6 +6,7 @@ import json
 import re
 from pathlib import Path
 
+from . import present
 from .checks import PROTECTED_PATHS, changed_paths, filtered_env, run_checks, validate_edits
 from .config import ROLES, resolve_role
 from .harness import make_harness
@@ -13,16 +14,13 @@ from .locks import record_safe_head
 from .state import atomic_json, load_json, merge_ledger, open_important, utcnow
 
 
-GATES = {
-    "open_questions": "Resolve .factory/issues/{issue}/spec.md, then run factory accept {issue}.",
-    "baseline_failing": "Fix the baseline checks by hand and commit on factory/{issue}.",
-    "no_progress": "Fix and commit by hand, or dismiss a finding with a reason.",
-    "rounds_exhausted": "Fix and commit by hand, or dismiss the remaining Important findings.",
-}
-
-
 class NeedsHuman(RuntimeError):
-    pass
+    """A gate: the run stopped for a decision only the operator can make."""
+
+    def __init__(self, reason, issue):
+        self.reason = reason
+        self.guidance = present.gate_guidance(reason, issue)
+        super().__init__(f"{reason}: {self.guidance}")
 
 
 class Engine:
@@ -116,7 +114,7 @@ class Engine:
         if self.state.get("pr") and not notice.get("sent"):
             head = self.repo.resolve(self.cwd, notice.get("sha", self.state["outcome_sha"]))
             body = (f"Factory needs human input: **{reason}**.\n\n"
-                    + GATES[reason].format(issue=self.issue) + "\n\n" + self.render_ledger())
+                    + present.gate_guidance(reason, self.issue) + "\n\n" + self.render_ledger())
             self.github.comment(self.state["pr"]["number"], body, f"factory:gate:{reason}:{head}")
             self.state["gate_notice"] = {"sha": head, "sent": True}
             self.save()
@@ -128,7 +126,7 @@ class Engine:
             self.state["gate_notice"] = {"sha": self.head(), "sent": False}
             self.save()
         self.gate_comment(reason)
-        raise NeedsHuman(f"{reason}: {GATES[reason].format(issue=self.issue)}")
+        raise NeedsHuman(reason, self.issue)
 
     def parked(self):
         outcome = self.state.get("outcome") or ""
@@ -182,34 +180,40 @@ class Engine:
         settings = self.role_settings[stage]
         name = settings["harness"]
         filtered_env(harness=name, auth=self.auth)
-        print(f"Issue #{self.issue}: {stage} using {name} ({self.auth})", flush=True)
-        record_safe_head(self.repo, self.issue, stage=stage)
-        prompt, schema = self.prompt(stage, number)
-        before = self.snapshot_dirty()
-        artifacts = self.snapshot_factory()
-        head = self.head()
-        adapter = make_harness(name, self.repo.local_dir / "transcripts")
+        present.stage_start(self.issue, stage, settings, self.auth, number)
+        elapsed = present.timer()
         try:
-            result = adapter.run(cwd=self.cwd, prompt_file=prompt, schema_file=schema,
-                                 mode="write" if stage in ("build", "fix") else "read",
-                                 model=settings["model"] or None, effort=settings["effort"] or None, auth=self.auth,
-                                 env=filtered_env(harness=name, auth=self.auth), timeout_s=self.timeout)
-        finally:
-            changed_artifacts = self.snapshot_factory()
-            if artifacts != changed_artifacts:
-                self.restore_factory(artifacts, changed_artifacts)
-            if self.head() != head:
-                self.repo.reset(self.cwd, head)
-                raise RuntimeError("harness changed Git HEAD; factory owns commits")
-            if artifacts != changed_artifacts:
-                raise ValueError(f"{stage} modified forbidden paths under .factory/")
-        if stage in ("spec", "plan", "review") and before != self.snapshot_dirty():
-            raise RuntimeError("read-mode harness modified the worktree")
-        if stage in ("build", "fix"):
-            dirty = self.snapshot_dirty()
-            paths = [p for p in dirty if p not in before or dirty[p] != before[p]]
-            paths.extend(p for p in before if p not in dirty)
-            validate_edits(paths, stage, self.issue, self.config, self.text("plan.md"))
+            record_safe_head(self.repo, self.issue, stage=stage)
+            prompt, schema = self.prompt(stage, number)
+            before = self.snapshot_dirty()
+            artifacts = self.snapshot_factory()
+            head = self.head()
+            adapter = make_harness(name, self.repo.local_dir / "transcripts")
+            try:
+                result = adapter.run(cwd=self.cwd, prompt_file=prompt, schema_file=schema,
+                                     mode="write" if stage in ("build", "fix") else "read",
+                                     model=settings["model"] or None, effort=settings["effort"] or None, auth=self.auth,
+                                     env=filtered_env(harness=name, auth=self.auth), timeout_s=self.timeout)
+            finally:
+                changed_artifacts = self.snapshot_factory()
+                if artifacts != changed_artifacts:
+                    self.restore_factory(artifacts, changed_artifacts)
+                if self.head() != head:
+                    self.repo.reset(self.cwd, head)
+                    raise RuntimeError("harness changed Git HEAD; factory owns commits")
+                if artifacts != changed_artifacts:
+                    raise ValueError(f"{stage} modified forbidden paths under .factory/")
+            if stage in ("spec", "plan", "review") and before != self.snapshot_dirty():
+                raise RuntimeError("read-mode harness modified the worktree")
+            if stage in ("build", "fix"):
+                dirty = self.snapshot_dirty()
+                paths = [p for p in dirty if p not in before or dirty[p] != before[p]]
+                paths.extend(p for p in before if p not in dirty)
+                validate_edits(paths, stage, self.issue, self.config, self.text("plan.md"))
+        except BaseException:
+            present.stage_failed(self.issue, stage, settings, elapsed(), number)
+            raise
+        present.stage_done(self.issue, stage, settings, elapsed(), number)
         return result
 
     def snapshot_dirty(self):
@@ -283,7 +287,8 @@ class Engine:
         self.publish()
 
     def check(self, stage, number):
-        print(f"Issue #{self.issue}: {stage} checks", flush=True)
+        present.checks_start(self.issue, stage, number)
+        elapsed = present.timer()
         record_safe_head(self.repo, self.issue, stage=f"{stage} checks")
         path = self.work / "checks" / f"{stage}-{number}.log"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -300,8 +305,7 @@ class Engine:
                 raise RuntimeError("checks changed Git HEAD; factory owns commits")
             if artifacts != changed_artifacts:
                 raise RuntimeError("checks modified factory files")
-        if not passed:
-            print(f"Checks failed; output: {path}")
+        present.checks_done(self.issue, stage, passed, path, elapsed(), number)
         return passed
 
     def spec(self):
